@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -13,6 +13,7 @@
 #include "skybox.h"
 #include "measurement.h"
 #include "updates-model.h"
+#include "bag-conversion-helper.h"
 #include <librealsense2/hpp/rs_export.hpp>
 
 namespace rs2
@@ -64,7 +65,7 @@ namespace rs2
     public:
         void reset_camera(float3 pos = { 0.0f, 0.0f, -1.0f });
 
-        void update_configuration();
+        void update_configuration(config_file* new_cfg = nullptr);
 
         const float panel_width = 340.f;
         const float panel_y = 50.f;
@@ -96,6 +97,19 @@ namespace rs2
 
         std::map<int, rect> calc_layout(const rect& r);
 
+        // Order the active streams for display: default is by stream type then index
+        // (depth, color, ir1, ir2, motion...), unless the user manually re-arranged
+        // the tiles - see _streams_order and the per-serial saved arrangements.
+        std::vector<stream_model*> order_active_streams(const std::set<stream_model*>& active_streams,
+            const std::map<stream_model*, int>& stream_index);
+
+        // Handle drag-to-swap of stream tiles while in re-arrange mode
+        void handle_streams_reorder(const std::map<int, rect>& layout, const mouse_info& mouse);
+
+        // Per-camera (serial) tile arrangement persistence in the config file
+        std::vector<std::string> get_saved_arrangement(const std::string& serial);
+        void persist_stream_arrangements();
+
         void show_no_stream_overlay(ImFont* font, int min_x, int min_y, int max_x, int max_y);
         void show_no_device_overlay(ImFont* font, int min_x, int min_y);
         void show_rendering_not_supported(ImFont* font_18, int min_x, int min_y, int max_x, int max_y, rs2_format format);
@@ -115,10 +129,13 @@ namespace rs2
 
         void update_3d_camera(ux_window& win, const rect& viewer_rect, bool force = false);
 
+        // Check if we should render the current frame (sometimes we have information only frames and the frame data itself has no visual affect)
+        bool should_render_frame(const rs2::stream_model& model) const;
+
         void show_top_bar(ux_window& window, const rect& viewer_rect, const device_models_list& devices);
 
         void render_3d_view(const rect& view_rect, ux_window& win,
-            std::shared_ptr<texture_buffer> texture, rs2::points points);
+            std::shared_ptr<texture_buffer> texture, rs2::points points, rs2::labeled_points);
 
         void render_2d_view(const rect& view_rect, ux_window& win, int output_height,
             ImFont *font1, ImFont *font2, size_t dev_model_num, const mouse_info &mouse, std::string& error_message);
@@ -134,6 +151,8 @@ namespace rs2
         std::map<int, int> streams_origin;
         bool fullscreen = false;
         stream_model* selected_stream = nullptr;
+        // When true, stream tiles can be re-arranged by dragging one onto another (toggled from the top bar)
+        bool allow_streams_reorder = false;
         std::shared_ptr<syncer_model> syncer;
         post_processing_filters ppf;
 
@@ -153,7 +172,8 @@ namespace rs2
 
         void draw_viewport(const rect& viewer_rect,
             ux_window& window, int devices, std::string& error_message,
-            std::shared_ptr<texture_buffer> texture, rs2::points  f = rs2::points());
+            std::shared_ptr<texture_buffer> texture, rs2::points  f = rs2::points(), 
+            rs2::labeled_points lp = rs2::labeled_points());
 
         bool allow_3d_source_change = true;
         bool allow_stream_close = true;
@@ -167,6 +187,7 @@ namespace rs2
         std::atomic<bool> synchronization_enable_prev_state;
 
         int selected_depth_source_uid = -1;
+        int selected_labeled_points_source_uid = -1;
         int selected_tex_source_uid = -1;
         std::vector<int> last_tex_sources;
         double texture_update_time = 0.0;
@@ -179,6 +200,15 @@ namespace rs2
         };
         shader_type selected_shader = shader_type::diffuse;
 
+        enum class lpc_points_size
+        {
+            lpc_small,
+            lpc_medium,
+            lpc_large
+        };
+        lpc_points_size selected_lpc_points_size = lpc_points_size::lpc_small;
+        bool show_safety_zones_3d = true;
+
         float dim_level = 1.f;
 
         bool continue_with_current_fw = false;
@@ -190,16 +220,30 @@ namespace rs2
         bool occlusion_invalidation = true;
         bool glsl_available = false;
         bool modal_notification_on = false; // a notification which was expanded
+        bool select_lpc_point_size = false;
 
-        press_button_model grid_object_button{ u8"\uf1cb", u8"\uf1cb",  "Configure Grid", "Configure Grid", false };
+        press_button_model grid_object_button{ textual_icons::codepen, textual_icons::codepen,
+            "Configure Grid", "Configure Grid", false };
 
         viewer_model(context &ctx_, bool disable_log_to_console = false );
 
         std::shared_ptr<updates_model> updates;
 
+        std::shared_ptr<bag_conversion_helper> bag_converter = std::make_shared<bag_conversion_helper>();
         std::unordered_set<int> _hidden_options;
         bool _support_ir_reflectivity;
+
     private:
+        void get_frame_objects_container( rs2::frame & frame, std::shared_ptr< atomic_objects_in_frame > & objects );
+        rs2::rect project_color_bbox_to_depth( const rs2::rect &    color_bbox,
+                                               const uint16_t *     depth_data,
+                                               float                depth_scale,
+                                               const rs2_intrinsics & depth_intrin,
+                                               const rs2_intrinsics & color_intrin,
+                                               const rs2_extrinsics & color_to_depth,
+                                               const rs2_extrinsics & depth_to_color,
+                                               const rs2::rect &    depth_frame_rect );
+        void process_object_detection_frames( std::map< int, rs2::frame > & last_frames );
 
         void check_permissions();
         void hide_common_options();
@@ -228,10 +272,25 @@ namespace rs2
 
         void set_export_popup(ImFont* large_font, ImFont* font, rect stream_rect, std::string& error_message, config_file& temp_cfg);
         void init_depth_uid(int& selected_depth_source, std::vector<std::string>& depth_sources_str, std::vector<int>& depth_sources);
+        void init_labeled_points_uid();
+        void draw_3d_labeled_points(const rect& viewer_rect, rs2::labeled_points labeled_points);
+        bool should_texture_frame_be_updated(const rs2::frame& f) const;
 
         streams_layout _layout;
         streams_layout _old_layout;
         std::chrono::high_resolution_clock::time_point _transition_start_time;
+
+        // User-defined display order of the stream tiles (holds stream keys from 'streams').
+        // Reconciled against the active streams every frame in order_active_streams().
+        std::vector<int> _streams_order;
+        // Cached per-camera (serial) tile arrangement, mirrored to the config file. Each value
+        // is an ordered list of stream descriptors (see stream_descriptor()).
+        std::map<std::string, std::vector<std::string>> _stream_arrangement_by_serial;
+        // Drag-to-swap state (valid while allow_streams_reorder is on)
+        int _dragged_stream = -1;
+        bool _is_dragging_stream = false;
+        bool _prev_reorder_mouse_down = false;
+        float2 _drag_origin{ 0.f, 0.f };
 
         // 3D-Viewer state
         float3 pos = { 0.0f, 0.0f, -0.5f };
@@ -244,6 +303,8 @@ namespace rs2
 
         rs2::points last_points;
         std::shared_ptr<texture_buffer> last_texture;
+        
+        rs2::labeled_points last_labeled_points;
 
         // Infinite pan / rotate feature:
         bool manipulating = false;
@@ -263,5 +324,11 @@ namespace rs2
 
         measurement _measurements;
 
+        typedef enum class Zone { Danger, Warning, Diagnostic } Zone;
+        void set_polygon_color(Zone zone);
+        std::vector<vertex> init_zone(Zone zone, const frame& frame, float scale_factor);
+        void draw_zone_2d(Zone zone, const rect& draw_within, const frame& frame);
+        void draw_zone_3d(Zone zone, const rs2::labeled_points& frame);
+        vertex transform_vertex(vertex v, const rect& normalize_from, const rect& unnormalize_to);
     };
 }

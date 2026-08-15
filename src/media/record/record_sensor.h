@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 #include "core/roi.h"
@@ -8,6 +8,8 @@
 #include "archive.h"
 #include "sensor.h"
 
+#include <memory>
+#include <mutex>
 #include <set>
 
 
@@ -24,11 +26,17 @@ namespace librealsense
         virtual ~record_sensor();
 
         void on_notification( std::function< void( const notification & ) > && callback )
-            { _on_notification = std::move( callback ); }
+        {
+            std::lock_guard< std::mutex > lock( m_callback_lifetime->mutex );
+            _on_notification = std::move( callback );
+        }
         void on_frame( std::function< void( frame_holder ) > && callback )
             { _on_frame = std::move( callback ); }
         void on_extension_change( std::function< void( rs2_extension, std::shared_ptr< extension_snapshot > ) > && callback )
-            { _on_extension_change = std::move( callback ); }
+        {
+            std::lock_guard< std::mutex > lock( m_callback_lifetime->mutex );
+            _on_extension_change = std::move( callback );
+        }
 
         void init();
         stream_profiles get_stream_profiles(int tag = profile_tag::PROFILE_TAG_ANY) const override;
@@ -55,6 +63,8 @@ namespace librealsense
         void stop_with_error(const std::string& message);
         void disable_recording();
         virtual processing_blocks get_recommended_processing_blocks() const override;
+        embedded_filters get_supported_embedded_filters() const override { return embedded_filters(); };
+
 
         rsutils::subscription register_options_changed_callback( options_watcher::callback && cb ) override
         {
@@ -66,7 +76,6 @@ namespace librealsense
         std::function< void( frame_holder ) > _on_frame;
         std::function< void( rs2_extension, std::shared_ptr< extension_snapshot > ) > _on_extension_change;
 
-        template <typename T> void record_snapshot(rs2_extension extension_type, const librealsense::recordable<T>& snapshot);
         void record_frame(frame_holder holder);
         void enable_sensor_hooks();
         void disable_sensor_hooks();
@@ -91,6 +100,18 @@ namespace librealsense
         bool m_is_sensor_hooked;
         bool m_register_notification_to_base;
         std::mutex m_mutex;
+
+        // Shared with every lambda this sensor registers on longer-lived objects (the
+        // live sensor's notifications dispatcher, individual options' on-change callbacks).
+        // The destructor takes the mutex and sets alive=false, so any in-flight invocation
+        // drains before the destructor returns and any future invocation bails out without
+        // dereferencing *this.
+        struct callback_lifetime
+        {
+            std::mutex mutex;
+            bool alive = true;
+        };
+        std::shared_ptr< callback_lifetime > m_callback_lifetime;
     };
 
     class notification_callback : public rs2_notifications_callback

@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include "context.h"
 #include "device-info.h"
@@ -33,20 +33,25 @@ namespace librealsense {
             return context_settings;
 
         auto const filename = rsutils::os::get_special_folder( rsutils::os::special_folder::app_data ) + RS2_CONFIG_FILENAME;
+        LOG_DEBUG( "Loading configuration file from: " << filename );
         auto config = rsutils::json_config::load_from_file( filename );
 
+        if (config.is_discarded())
+        {
+            LOG_WARNING( "No valid configuration file found at : " << filename << " loading defaults" );
+        }
         // Take only the 'context' part of it
         config = rsutils::json_config::load_settings( config, "context", "config-file" );
 
         // Patch the given context settings into the configuration
         config.override( context_settings, "context settings" );
+        LOG_DEBUG( "Loaded context configuration: " << config.dump(4) );
+
         return config;
     }
 
 
     context::context( json const & settings )
-        : _settings( load_settings( settings ) )  // global | application | local
-        , _device_mask( _settings.nested( "device-mask" ).default_value< unsigned >( RS2_PRODUCT_LINE_ANY ) )
     {
         static bool version_logged = false;
         if( ! version_logged )
@@ -54,16 +59,22 @@ namespace librealsense {
             version_logged = true;
             LOG_DEBUG( "Librealsense VERSION: " << RS2_API_FULL_VERSION_STR );
         }
+
+         _settings = load_settings( settings );  // global | application | local
+         _device_mask = _settings.nested( "device-mask" ).default_value< unsigned >( RS2_PRODUCT_LINE_ANY );
     }
 
 
     void context::create_factories( std::shared_ptr< context > const & sptr )
     {
-        _factories.push_back( std::make_shared< backend_device_factory >(
-            sptr,
-            [this]( std::vector< std::shared_ptr< device_info > > const & removed,
-                    std::vector< std::shared_ptr< device_info > > const & added )
-            { invoke_devices_changed_callbacks( removed, added ); } ) );
+        if( 0 == ( get_device_mask() & RS2_PRODUCT_LINE_SW_ONLY ) )
+        {
+            _factories.push_back( std::make_shared< backend_device_factory >(
+                sptr,
+                [this]( std::vector< std::shared_ptr< device_info > > const & removed,
+                        std::vector< std::shared_ptr< device_info > > const & added )
+                { invoke_devices_changed_callbacks( removed, added ); } ) );
+        }
 
 #ifdef BUILD_WITH_DDS
         _factories.push_back( std::make_shared< rsdds_device_factory >(
@@ -85,7 +96,12 @@ namespace librealsense {
 
     /*static*/ std::shared_ptr< context > context::make( char const * json_settings )
     {
-        return make( ( ! json_settings || ! *json_settings ) ? json::object() : json::parse( json_settings ) );
+        if ( ! json_settings || ! *json_settings )
+            return make(json::object());
+
+        json raw_j = json::parse(json_settings, nullptr, false);
+
+        return make(raw_j);
     }
 
 
@@ -113,7 +129,7 @@ namespace librealsense {
         {
             for( auto & dev_info : factory->query_devices( requested_mask ) )
             {
-                LOG_INFO( "... " << dev_info->get_address() );
+                LOG_DEBUG( "... " << dev_info->get_address() );
                 list.push_back( dev_info );
             }
         }
@@ -121,12 +137,12 @@ namespace librealsense {
         {
             if( auto dev_info = item.second.lock() )
             {
-                LOG_INFO( "... " << dev_info->get_address() );
+                LOG_DEBUG( "... " << dev_info->get_address() );
                 list.push_back( dev_info );
             }
         }
-        LOG_INFO( "Found " << list.size() << " RealSense devices (0x" << std::hex << requested_mask << " requested & 0x"
-                           << get_device_mask() << " from device-mask in settings)" << std::dec );
+        LOG_DEBUG( "Found " << list.size() << " RealSense devices (0x" << std::hex << requested_mask
+                            << " requested & 0x" << get_device_mask() << " from device-mask in settings)" << std::dec );
         return list;
     }
 

@@ -1,9 +1,10 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include "algo.h"
 #include "option.h"
 #include "core/video-frame.h"
+#include <algorithm>
 
 using namespace librealsense;
 
@@ -224,14 +225,20 @@ void auto_exposure_algorithm::modify_exposure(float& exposure_value, bool& exp_m
 
 bool auto_exposure_algorithm::analyze_image(const frame_interface* image)
 {
-    region_of_interest image_roi = roi;
+    bool roi_initialized;
+    region_of_interest image_roi;
+    {
+        std::lock_guard< std::recursive_mutex > lock( state_mutex );
+        roi_initialized = is_roi_initialized;
+        image_roi = roi;
+    }
     auto number_of_pixels = (image_roi.max_x - image_roi.min_x + 1)*(image_roi.max_y - image_roi.min_y + 1);
     if (number_of_pixels == 0)
         return false;   // empty image
 
     auto frame = ((video_frame*)image);
 
-    if (!is_roi_initialized)
+    if (!roi_initialized)
     {
         auto width = frame->get_width();
         auto height = frame->get_height();

@@ -1,12 +1,14 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023-2024 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
 #include <vector>
 #include <set>
+#include <string>
 #include <cstdint>
 
+namespace rsutils { struct version; }
 
 namespace librealsense {
 namespace platform {
@@ -15,6 +17,7 @@ namespace platform {
 struct uvc_device_info;
 struct hid_device_info;
 struct usb_device_info;
+struct mipi_device_info;
 
 
 // Helper functions for device list manipulation:
@@ -33,6 +36,11 @@ std::vector< uvc_device_info > filter_by_mi( const std::vector< uvc_device_info 
 std::vector< usb_device_info > filter_by_product( const std::vector< usb_device_info > & devices,
                                                   const std::set< uint16_t > & pid_list );
 void trim_device_list( std::vector< usb_device_info > & devices, const std::vector< usb_device_info > & chosen );
+
+// Get MIPI driver version on Jetson platform
+// (cached after first call)
+// Returns 0.0.0.0 if no driver version is found
+rsutils::version get_jetson_driver_version();
 
 
 }  // namespace platform

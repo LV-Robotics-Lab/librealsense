@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include <rsutils/json-fwd.h>
@@ -134,6 +134,7 @@ public:
     uint16_t width() const { return _width; }
     uint16_t height() const { return _height; }
     dds_video_encoding const & encoding() const { return _encoding; }
+    bool is_compressed_encoding() const;
 
     std::string details_to_string() const override;
 
@@ -151,6 +152,23 @@ public:
     {
     }
     dds_motion_stream_profile( rsutils::json const & j, int & index )
+        : super( j, index )
+    {
+    }
+};
+
+
+class dds_inference_stream_profile : public dds_stream_profile
+{
+    typedef dds_stream_profile super;
+
+public:
+    dds_inference_stream_profile( int16_t frequency )
+        : super( frequency )
+    {
+    }
+
+    dds_inference_stream_profile( rsutils::json const & j, int & index )
         : super( j, index )
     {
     }

@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include "device.h"
 
@@ -37,6 +37,23 @@ device::device( std::shared_ptr< const device_info > const & dev_info,
     : _dev_info( dev_info )
     , _is_alive( std::make_shared< std::atomic< bool > >( true ) )
     , _profiles_tags( [this]() { return get_profiles_tags(); } )
+    , _format_conversion(
+          [this]
+          {
+              auto context = get_context();
+              if( ! context )
+                  return format_conversion::full;
+              std::string const format_conversion( "format-conversion", 17 );
+              std::string const full( "full", 4 );
+              auto const value = context->get_settings().nested( format_conversion ).default_value( full );
+              if( value == full )
+                  return format_conversion::full;
+              if( value == "basic" )
+                  return format_conversion::basic;
+              if( value == "raw" )
+                  return format_conversion::raw;
+              throw invalid_value_exception( "invalid " + format_conversion + " value '" + value + "'" );
+          } )
 {
     if( device_changed_notifications )
     {
@@ -177,41 +194,36 @@ void device::register_stream_to_extrinsic_group(const stream_interface& stream, 
     }
 }
 
-std::vector<rs2_format> device::map_supported_color_formats(rs2_format source_format)
+std::vector< rs2_format > device::map_supported_color_formats( rs2_format source_format, bool should_map_source_format )
 {
     // Mapping from source color format to all of the compatible target color formats.
 
     std::vector<rs2_format> target_formats = { RS2_FORMAT_RGB8, RS2_FORMAT_RGBA8, RS2_FORMAT_BGR8, RS2_FORMAT_BGRA8 };
     switch (source_format)
     {
+    case RS2_FORMAT_M420:
+        target_formats.push_back(RS2_FORMAT_M420);
+        break;
+    case RS2_FORMAT_NV12:
+        target_formats.push_back(RS2_FORMAT_NV12);
+        break;
     case RS2_FORMAT_YUYV:
-        target_formats.push_back(RS2_FORMAT_YUYV);
-        target_formats.push_back(RS2_FORMAT_Y8);
         break;
     case RS2_FORMAT_UYVY:
-        target_formats.push_back(RS2_FORMAT_UYVY);
         break;
     default:
         LOG_ERROR("Format is not supported for mapping");
     }
+
+    if( should_map_source_format )
+        target_formats.push_back( source_format );
+
     return target_formats;
 }
 
 format_conversion device::get_format_conversion() const
 {
-    auto context = get_context();
-    if( ! context )
-        return format_conversion::full;
-    std::string const format_conversion( "format-conversion", 17 );
-    std::string const full( "full", 4 );
-    auto const value = context->get_settings().nested( format_conversion ).default_value( full );
-    if( value == full )
-        return format_conversion::full;
-    if( value == "basic" )
-        return format_conversion::basic;
-    if( value == "raw" )
-        return format_conversion::raw;
-    throw invalid_value_exception( "invalid " + format_conversion + " value '" + value + "'" );
+    return *_format_conversion;
 }
 
 void device::tag_profiles(stream_profiles profiles) const

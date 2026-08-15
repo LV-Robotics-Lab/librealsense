@@ -1,8 +1,11 @@
 /* License: Apache 2.0. See LICENSE file in root directory.
-Copyright(c) 2017 Intel Corporation. All Rights Reserved. */
+Copyright(c) 2017 RealSense, Inc. All Rights Reserved. */
 
 #include "pyrealsense2.h"
 #include <librealsense2/hpp/rs_processing.hpp>
+#include "proc/synthetic-stream.h"
+#include "proc/color-formats-converter.h"
+#include <memory>
 
 void init_processing(py::module &m) {
     /** rs_processing.hpp **/
@@ -65,6 +68,7 @@ void init_processing(py::module &m) {
             return new rs2::filter(filter_function, queue_size);
         }), "filter_function"_a, "queue_size"_a = 1)
         .def(BIND_DOWNCAST(filter, decimation_filter))
+        .def( BIND_DOWNCAST( filter, rotation_filter ) )
         .def(BIND_DOWNCAST(filter, disparity_transform))
         .def(BIND_DOWNCAST(filter, hole_filling_filter))
         .def(BIND_DOWNCAST(filter, spatial_filter))
@@ -87,6 +91,21 @@ void init_processing(py::module &m) {
                                                           "but the SDK will automatically try to use SSE2, AVX, or CUDA instructions where available to "
                                                           "get better performance. Othere implementations (GLSL, OpenCL, Neon, NCS) should follow.");
     yuy_decoder.def(py::init<>());
+
+    // Parameterized converters: same internal classes the SDK uses for live cameras,
+    // exposed here as factories so tests can pick the output format.
+#define BIND_CONVERTER(name) \
+    m.def(#name, [](rs2_format target) { \
+        auto block = std::shared_ptr<rs2_processing_block>( \
+            new rs2_processing_block{ std::make_shared<librealsense::name>(target) }, \
+            rs2_delete_processing_block); \
+        return rs2::filter(block, 1); \
+    }, "target_format"_a)
+    BIND_CONVERTER(yuy2_converter);
+    BIND_CONVERTER(uyvy_converter);
+    BIND_CONVERTER(m420_converter);
+    BIND_CONVERTER(nv12_converter);
+#undef BIND_CONVERTER
 
     py::class_<rs2::threshold_filter, rs2::filter> threshold(m, "threshold_filter", "Depth thresholding filter. By controlling min and "
                                                              "max options on the block, one could filter out depth values that are either too large "
@@ -157,6 +176,9 @@ void init_processing(py::module &m) {
     decimation_filter.def(py::init<>())
         .def(py::init<float>(), "magnitude"_a);
 
+    py::class_< rs2::rotation_filter, rs2::filter > rotation_filter(m, "rotation_filter","Performs rotation of frames." );
+    rotation_filter.def( py::init<>() ).def( py::init< std::vector< rs2_stream > >(), "value"_a );
+
     py::class_<rs2::temporal_filter, rs2::filter> temporal_filter(m, "temporal_filter", "Temporal filter smooths the image by calculating multiple frames "
                                                                   "with alpha and delta settings. Alpha defines the weight of current frame, and delta defines the"
                                                                   "threshold for edge classification and preserving.");
@@ -196,5 +218,18 @@ void init_processing(py::module &m) {
     sequence_id_filter.def(py::init<>())
         .def(py::init<float>(), "sequence_id"_a);
     // rs2::rates_printer
+
+    py::class_<rs2::embedded_filter, rs2::options> embedded_filter(m, "embedded_filter", "Define the embedded filter workflow.");
+    embedded_filter.def( BIND_DOWNCAST( embedded_filter, embedded_decimation_filter ) )
+        .def( BIND_DOWNCAST( embedded_filter, embedded_temporal_filter ) )
+        .def( "__bool__", &rs2::embedded_filter::operator bool )  // Called to implement truth value testing in Python 3
+        .def( "get_type", &rs2::embedded_filter::get_type, "Get the embedded filter type" );
+
+    py::class_<rs2::embedded_decimation_filter, rs2::embedded_filter> embedded_decimation_filter(m, "embedded_decimation_filter",
+        "Define the embedded decimation filter workflow.");
+
+    py::class_<rs2::embedded_temporal_filter, rs2::embedded_filter> embedded_temporal_filter(m, "embedded_temporal_filter",
+        "Define the embedded temporal filter workflow.");
+
     /** end rs_processing.hpp **/
 }

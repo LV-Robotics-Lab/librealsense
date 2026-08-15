@@ -1,8 +1,12 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2021 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2021 RealSense, Inc. All Rights Reserved.
 
 //#cmake: static!
 //#cmake:add-file ../../../src/proc/sse/sse-pointcloud.cpp
+
+// The CUDA cases below need a GPU, which GHA runners don't have. Marking the test as requiring a
+// live device makes LibCI run it on the Jenkins Jetson agent, the only CI machine that builds with CUDA.
+//#test:device:jetson D457
 
 #include "../algo-common.h"
 #include <librealsense2/rsutil.h>
@@ -120,7 +124,8 @@ TEST_CASE("inverse_brown_conrady_cuda_deproject")
     librealsense::float2 pixel = { 0, 0 };
 
     std::vector<uint16_t> depth(1280 * 720, 1000);
-    rscuda::deproject_depth_cuda((float*)point.data(), intrin, depth.data(), 1);
+    rscuda::pointcloud_cuda_helper helper;
+    helper.deproject_depth_cuda((float*)point.data(), intrin, depth.data(), 1);
     for (auto i = 0; i < 720; i++)
     {
         for (auto j = 0; j < 1280; j++)
@@ -139,7 +144,8 @@ TEST_CASE("brown_conrady_cuda_deproject")
     librealsense::float2 pixel = { 0, 0 };
 
     std::vector<uint16_t> depth(1280 * 720, 1000);
-    rscuda::deproject_depth_cuda((float*)point.data(), intrin, depth.data(), 1);
+    rscuda::pointcloud_cuda_helper helper;
+    helper.deproject_depth_cuda((float*)point.data(), intrin, depth.data(), 1);
     for (auto i = 0; i < 720; i++)
     {
         for (auto j = 0; j < 1280; j++)

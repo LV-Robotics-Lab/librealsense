@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #include "playback_sensor.h"
 #include "playback_device.h"
@@ -7,7 +7,8 @@
 #include <map>
 #include "types.h"
 #include "ds/d400/d400-options.h"
-#include "media/ros/ros_reader.h"
+#include "media/ros_common.h"
+#include "environment.h"
 
 #include <rsutils/string/from.h>
 

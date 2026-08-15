@@ -1,6 +1,4 @@
-
-# Xenial requires 3.5, Bionic 3.10...
-cmake_minimum_required(VERSION 3.1.0)
+cmake_minimum_required(VERSION 3.10)
 
 set( LRS_TARGET realsense2 )
 project( ${LRS_TARGET} LANGUAGES CXX C )
@@ -17,18 +15,15 @@ if(${FORCE_LIBUVC} OR ${FORCE_WINUSB_UVC} OR ${ANDROID_USB_HOST_UVC})
     set(FORCE_RSUSB_BACKEND ON)
 endif()
 
-# Checking Internet connection, as DEPTH CAM needs to download the FW from amazon cloud
-if(IMPORT_DEPTH_CAM_FW AND NOT INTERNET_CONNECTION)
-    message(WARNING "No internet connection, disabling IMPORT_DEPTH_CAM_FW")
-    set(IMPORT_DEPTH_CAM_FW OFF)
-endif()
-
 if (BUILD_PC_STITCHING AND NOT BUILD_GLSL_EXTENSIONS)
     MESSAGE(STATUS "BUILD_PC_STITCHING explicitely depends on BUILD_GLSL_EXTENSIONS, set it ON")
     SET(BUILD_GLSL_EXTENSIONS ON)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/CMake)
+
+# include security flags helper functions
+include(CMake/security_flags_helper_functions.cmake)
 
 # include librealsense general configuration
 include(CMake/global_config.cmake)
@@ -47,6 +42,15 @@ global_set_flags()
 
 # If no type is given explicitly the type is STATIC or SHARED based on whether the current value of the variable [BUILD_SHARED_LIBS](https://cmake.org/cmake/help/v3.10/variable/BUILD_SHARED_LIBS.html#variable:BUILD_SHARED_LIBS) is ON
 add_library(${LRS_TARGET})
+# Apply ASan flags if enabled
+if(BUILD_ASAN)
+  message(STATUS "AddressSanitizer is enabled")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -g")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -g")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+  target_compile_options(${LRS_TARGET} PRIVATE -fsanitize=address -g)
+endif()
 
 config_cxx_flags()
 
@@ -60,17 +64,17 @@ include(third-party/CMakeLists.txt)
 target_link_libraries( ${LRS_TARGET} PUBLIC rsutils )
 
 if(BUILD_WITH_DDS)
-    if (CMAKE_SYSTEM MATCHES "Windows" OR CMAKE_SYSTEM MATCHES "Linux")
+    message(STATUS "Building with FastDDS")
+	include(CMake/external_foonathan_memory.cmake)
+	include(CMake/external_fastdds.cmake)
 
-        message(STATUS "Building with FastDDS")
-        include(CMake/external_foonathan_memory.cmake)
-        include(CMake/external_fastdds.cmake)
-
-        target_link_libraries( ${LRS_TARGET} PRIVATE realdds )
-
-    else()
-        MESSAGE(STATUS "Turning off `BUILD_WITH_DDS` as it's only supported on Windows & Linux and not on ${CMAKE_SYSTEM}")
-        set(BUILD_WITH_DDS OFF)
+	target_link_libraries( ${LRS_TARGET} PRIVATE realdds )
+else()
+    if(BUILD_ROSBAG2)
+        # Even without full DDS support, we need fastcdr for ROS2 bag file serialization
+        message(STATUS "Building with FastCDR for ROS2 bag support")
+        include(CMake/external_fastcdr.cmake)
+        target_link_libraries( ${LRS_TARGET} PRIVATE fastcdr )
     endif()
 endif()
 
@@ -102,13 +106,9 @@ elseif(BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
-if(BUILD_UNIT_TESTS OR BUILD_LEGACY_LIVE_TEST)
+if(BUILD_UNIT_TESTS)
     include( CMake/external_catch2.cmake )
     add_subdirectory(unit-tests)
-endif()
-
-if(IMPORT_DEPTH_CAM_FW)
-    add_subdirectory(common/fw)
 endif()
 
 include(CMake/embedd_udev_rules.cmake)

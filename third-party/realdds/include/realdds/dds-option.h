@@ -1,9 +1,9 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2024 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2024 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include <rsutils/json.h>
-#include <rsutils/string/ip-address.h>
+#include <rsutils/type/ip-address.h>
 
 #include <string>
 #include <vector>
@@ -103,6 +103,9 @@ protected:
 
 typedef std::vector< std::shared_ptr< dds_option > > dds_options;
 
+rsutils::json dds_options_to_json(dds_options const& options);
+
+std::shared_ptr< dds_option > find_dds_option_by_name(const dds_options& options, const std::string& name);
 
 class dds_float_option : public dds_option
 {
@@ -194,7 +197,7 @@ class dds_ip_option : public dds_string_option
     using super = dds_string_option;
 
 public:
-    using ip_address = rsutils::string::ip_address;
+    using ip_address = rsutils::type::ip_address;
 
     char const * value_type() const override { return "ip-address"; }
 
@@ -205,6 +208,30 @@ public:
 
 protected:
     rsutils::json props_to_json() const override;
+};
+
+
+class dds_rect_option : public dds_option
+{
+    using super = dds_option;
+
+public:
+    struct type
+    {
+        int x1, y1;
+        int x2, y2;
+
+        rsutils::json to_json() const;
+        static type from_json( rsutils::json const & j ) { return { j[0], j[1], j[2], j[3] }; }
+    };
+
+public:
+    type get_rect() const { return type::from_json( get_value() ); }
+
+    char const * value_type() const override { return "rect"; }
+
+    void check_type( rsutils::json & value ) const override;
+    static type check_rect( rsutils::json const & );
 };
 
 

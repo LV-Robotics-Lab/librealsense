@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
+#include <realsense_imgui.h>
 #include <string>
 #include <functional>
 #include <thread>
@@ -75,7 +76,7 @@ namespace rs2
         bool is_ui_aligned() { return _is_ui_aligned; }
         bool is_fullscreen() { return _fullscreen; }
 
-        texture_buffer& get_splash() { return _splash_tex; }
+        texture_buffer& get_splash() { return *_splash_tex; }
 
         void reload();
         void refresh();
@@ -111,7 +112,10 @@ namespace rs2
         bool                     _first_frame;
         std::atomic<bool>        _app_ready;
         std::atomic<bool>        _keep_alive;
-        texture_buffer           _splash_tex;
+        // Held by unique_ptr so we can release it (and its GL texture) BEFORE
+        // ~ux_window destroys the GLFW window + context. Member dtors run after
+        // the dtor body, by which time glDeleteTextures would have no context.
+        std::unique_ptr<texture_buffer> _splash_tex = std::make_unique<texture_buffer>();
         rsutils::time::stopwatch   _splash_timer;
         std::string              _title_str;
         std::vector<std::string> _on_load_message;

@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include "rsusb-backend.h"
 
@@ -63,6 +63,11 @@ namespace librealsense
         std::vector<hid_device_info> rs_backend::query_hid_devices() const
         {
             return query_hid_devices_info();
+        }
+
+        std::vector<mipi_device_info> rs_backend::query_mipi_devices() const
+        {
+            return std::vector<mipi_device_info>();
         }
     }
 }

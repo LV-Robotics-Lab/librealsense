@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 
 #include "ds-color-common.h"
 #include "metadata.h"
@@ -14,6 +14,40 @@
 namespace librealsense
 {
     using namespace ds;
+
+    uvc_pu_auto_exposure_option::uvc_pu_auto_exposure_option(
+        const std::weak_ptr< uvc_sensor > & ep,
+        const std::weak_ptr< option > & exposure_option )
+        : uvc_pu_option( ep, RS2_OPTION_ENABLE_AUTO_EXPOSURE )
+        , _exposure_option( exposure_option )
+    {
+    }
+
+    void uvc_pu_auto_exposure_option::set( float value )
+    {
+        uvc_pu_option::set( value );
+
+        // When AE is turned off, the device may keep streaming with the last
+        // auto-computed exposure. Re-write the default exposure to force the
+        // device to apply a known manual value.
+        if( value != 0 )
+            return;
+
+        auto exposure = _exposure_option.lock();
+        if( ! exposure )
+            return;
+
+        try
+        {
+            float def_exposure = exposure->get_range().def;
+            LOG_DEBUG( "Applying default exposure " << def_exposure << " after AE disable" );
+            exposure->set( def_exposure );
+        }
+        catch( const std::exception & e )
+        {
+            LOG_WARNING( "Applying default exposure after AE disable failed: " << e.what() );
+        }
+    }
 
     ds_color_common::ds_color_common( const std::shared_ptr< uvc_sensor > & raw_color_ep,
                                       synthetic_sensor & color_ep,
@@ -37,7 +71,6 @@ namespace librealsense
         _color_ep.register_pu(RS2_OPTION_SHARPNESS);
 
         auto white_balance_option = std::make_shared<uvc_pu_option>(_raw_color_ep, RS2_OPTION_WHITE_BALANCE);
-        _color_ep.register_option(RS2_OPTION_WHITE_BALANCE, white_balance_option);
         auto auto_white_balance_option = std::make_shared<uvc_pu_option>(_raw_color_ep, RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE);
         _color_ep.register_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, auto_white_balance_option);
         _color_ep.register_option(RS2_OPTION_WHITE_BALANCE,
@@ -50,7 +83,7 @@ namespace librealsense
     {
         auto gain_option = std::make_shared<uvc_pu_option>(_raw_color_ep, RS2_OPTION_GAIN);
         auto exposure_option = std::make_shared<uvc_pu_option>(_raw_color_ep, RS2_OPTION_EXPOSURE);
-        auto auto_exposure_option = std::make_shared<uvc_pu_option>(_raw_color_ep, RS2_OPTION_ENABLE_AUTO_EXPOSURE);
+        auto auto_exposure_option = std::make_shared<uvc_pu_auto_exposure_option>(_raw_color_ep, exposure_option);
         _color_ep.register_option(RS2_OPTION_GAIN, gain_option);
         _color_ep.register_option(RS2_OPTION_EXPOSURE, exposure_option);
         _color_ep.register_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, auto_exposure_option);
@@ -66,7 +99,6 @@ namespace librealsense
 
     void ds_color_common::register_metadata()
     {
-        _color_ep.register_metadata(RS2_FRAME_METADATA_FRAME_TIMESTAMP, make_uvc_header_parser(&platform::uvc_header::timestamp));
         _color_ep.register_metadata(RS2_FRAME_METADATA_ACTUAL_FPS, std::make_shared<ds_md_attribute_actual_fps>());
 
         // attributes of md_capture_timing
@@ -75,8 +107,6 @@ namespace librealsense
             offsetof(md_rgb_normal_mode, intel_capture_timing);
 
         _color_ep.register_metadata(RS2_FRAME_METADATA_FRAME_COUNTER, make_attribute_parser(&md_capture_timing::frame_counter, md_capture_timing_attributes::frame_counter_attribute, md_prop_offset));
-        _color_ep.register_metadata(RS2_FRAME_METADATA_SENSOR_TIMESTAMP, make_rs400_sensor_ts_parser(make_uvc_header_parser(&platform::uvc_header::timestamp),
-            make_attribute_parser(&md_capture_timing::sensor_timestamp, md_capture_timing_attributes::sensor_timestamp_attribute, md_prop_offset)));
 
         // attributes of md_rgb_control
         md_prop_offset = metadata_raw_mode_offset +

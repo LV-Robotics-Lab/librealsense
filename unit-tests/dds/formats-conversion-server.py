@@ -1,19 +1,20 @@
 # License: Apache 2.0. See LICENSE file in root directory.
-# Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+# Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 
 import pyrealdds as dds
-from rspy import log, test
+from rspy import log, test, config_file
 import pyrealsense2 as rs
 
 dds.debug( log.is_debug_on(), log.nested )
 
 
 participant = dds.participant()
-participant.init( 123, "formats-conversion-server" )
+participant.init( config_file.get_domain_from_config_file_or_default(), "formats-conversion-server" )
 
 device_info = dds.message.device_info.from_json({
     "name": "formats-conversion-device",
-    "topic-root": "root_123"
+    "topic-root": "root_123",
+    "product-line": "D400"
 })
 
 # Used to created a device_server per test case, but it currently creates problems when creating a second device while

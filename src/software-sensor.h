@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include "sensor.h"
@@ -7,6 +7,7 @@
 #include <librealsense2/hpp/rs_types.hpp>
 #include <librealsense2/h/rs_internal.h>
 #include <rsutils/lazy.h>
+#include <embedded-filter-interface.h>
 
 namespace librealsense {
 
@@ -14,6 +15,7 @@ namespace librealsense {
 class software_device;
 class stream_profile_interface;
 class video_stream_profile_interface;
+class embedded_filter_interface;
 
 
 class software_sensor
@@ -25,11 +27,13 @@ public:
     ~software_sensor();
 
     virtual std::shared_ptr< stream_profile_interface > add_video_stream( rs2_video_stream video_stream,
-                                                                          bool is_default = false );
+                                                                          bool is_default = false, std::string name = "" );
     virtual std::shared_ptr< stream_profile_interface > add_motion_stream( rs2_motion_stream motion_stream,
-                                                                           bool is_default = false );
+                                                                           bool is_default = false, std::string name = "" );
     virtual std::shared_ptr< stream_profile_interface > add_pose_stream( rs2_pose_stream pose_stream,
-                                                                         bool is_default = false );
+                                                                         bool is_default = false, std::string name = "" );
+    virtual std::shared_ptr< stream_profile_interface > add_inference_stream( rs2_inference_stream inference_stream,
+                                                                              bool is_default = false, std::string name = "" );
 
     bool extend_to( rs2_extension extension_type, void ** ptr ) override;
 
@@ -53,6 +57,10 @@ public:
     void set_metadata( rs2_frame_metadata_value key, rs2_metadata_type value );
     void erase_metadata( rs2_frame_metadata_value key );
 
+    // options_container
+public:
+    std::vector< rs2_option > get_supported_options() const override;
+
 protected:
     frame_interface * allocate_new_frame( rs2_extension, stream_profile_interface *, frame_additional_data && );
     frame_interface * allocate_new_video_frame( video_stream_profile_interface *, int stride, int bpp, frame_additional_data && );
@@ -61,6 +69,7 @@ protected:
     metadata_array _metadata_map;
 
     processing_blocks get_recommended_processing_blocks() const override { return _pbs; }
+    embedded_filters get_supported_embedded_filters() const override { return embedded_filters(); };
     void add_processing_block( std::shared_ptr< processing_block_interface > const & );
 
     // We build profiles using add_video_stream(), etc., and feed those into init_stream_profiles() which could in

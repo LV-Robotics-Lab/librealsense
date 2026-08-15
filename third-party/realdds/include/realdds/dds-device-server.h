@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2024 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2024 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include <realdds/dds-option.h>
@@ -16,15 +16,6 @@
 #include <memory>
 #include <string>
 #include <functional>
-
-
-namespace eprosima {
-namespace fastdds {
-namespace dds {
-struct SampleInfo;
-}  // namespace dds
-}  // namespace fastdds
-}  // namespace eprosima
 
 
 namespace realdds {
@@ -74,6 +65,7 @@ public:
     dds_guid const & guid() const;
     std::shared_ptr< dds_participant > participant() const;
     std::shared_ptr< dds_subscriber > subscriber() const { return _subscriber; }
+    std::shared_ptr< dds_publisher > publisher() const { return _publisher; }
     std::string const & topic_root() const { return _topic_root; }
     rsutils::string::slice debug_name() const;
 
@@ -94,6 +86,7 @@ public:
     bool operator!() const { return ! is_valid(); }
 
     std::map< std::string, std::shared_ptr< dds_stream_server > > const & streams() const { return _stream_name_to_server; }
+    dds_options const & options() const { return _options; }
 
     void publish_notification( topics::flexible_msg && );
     void publish_metadata( rsutils::json && );
@@ -113,6 +106,7 @@ public:
     // Same as find_options, except throws if not found
     std::shared_ptr< dds_option > get_option( std::string const & option_name, std::string const & stream_name ) const;
 
+
 private:
     struct control_sample;
 
@@ -120,6 +114,7 @@ private:
     void on_set_option( control_sample const &, rsutils::json & reply );
     void on_query_option( control_sample const &, rsutils::json & reply );
     void on_query_options( control_sample const &, rsutils::json & reply );
+    void on_query_filter(control_sample const&, rsutils::json& reply);
 
     rsutils::json query_option( std::shared_ptr< dds_option > const & ) const;
 

@@ -1,7 +1,8 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 
 #include <realdds/dds-stream-server.h>
+#include <realdds/dds-stream-profile.h>
 
 #include <realdds/dds-topic-writer.h>
 #include <realdds/dds-topic.h>
@@ -10,9 +11,8 @@
 #include <realdds/dds-utilities.h>
 #include <realdds/topics/image-msg.h>
 #include <realdds/topics/imu-msg.h>
+#include <realdds/topics/string-msg.h>
 #include <realdds/topics/flexible-msg.h>
-#include <realdds/topics/ros2/ros2imagePubSubTypes.h>
-#include <realdds/topics/ros2/ros2imuPubSubTypes.h>
 #include <realdds/dds-time.h>
 
 #include <fastdds/dds/topic/Topic.hpp>
@@ -197,23 +197,27 @@ void dds_stream_server::close()
     _writer.reset();
 }
 
-void dds_video_stream_server::publish_image( topics::image_msg && image )
+void dds_video_stream_server::publish_image( topics::image_msg & image )
 {
     if( ! is_streaming() )
-        DDS_THROW( runtime_error, "stream '" + name() + "' cannot publish before start_streaming()" );
+        DDS_THROW( runtime_error, "stream '" << name() << "' cannot publish before start_streaming()" );
 
-    if( image.height != _image_header.height )
+    if( ! image.is_valid() )
+        DDS_THROW( runtime_error, "image is invalid" );
+
+    if( ! image.height() )
+        image.set_height( _image_header.height );
+    else if( image.height() != _image_header.height )
         DDS_THROW( runtime_error,
-                   "image height (" + std::to_string( image.height ) + ") does not match stream header ("
-                       + std::to_string( _image_header.height ) + ")" );
-    if( image.width != _image_header.width )
+                   "image height (" << image.height() << ") does not match stream header (" << _image_header.height << ")" );
+    if( ! image.width() )
+        image.set_width( _image_header.width );
+    else if( image.width() != _image_header.width )
         DDS_THROW( runtime_error,
-                   "image width (" + std::to_string( image.width ) + ") does not match stream header ("
-                       + std::to_string( _image_header.width ) + ")" );
+                   "image width (" << image.width() << ") does not match stream header (" << _image_header.width << ")" );
 
     // LOG_DEBUG( "publishing a DDS video frame for topic: " << _writer->topic()->get()->get_name() );
-    sensor_msgs::msg::Image raw_image;
-    
+
     // "The frame_id in a message specifies the point of reference for data contained in that message."
     // 
     // I.e., the frame_id in a ROS header is the ID of the sensor collecting the data, and only relevant
@@ -223,22 +227,23 @@ void dds_video_stream_server::publish_image( topics::image_msg && image )
     //
     // For us, for now, we specify the name of the sensor and the device that owns it (TODO):
     //
-    raw_image.header().frame_id() = sensor_name();
+    if( image.frame_id().empty() )
+        image.set_frame_id( sensor_name() );
 
-    raw_image.header().stamp().sec() = image.timestamp.seconds;
-    raw_image.header().stamp().nanosec() = image.timestamp.nanosec;
+    if( image.encoding().empty() )
+        image.set_encoding( _image_header.encoding.to_string() );
+    else if( dds_video_encoding( image.encoding() ) != _image_header.encoding )
+        DDS_THROW( runtime_error,
+                   "image encoding (" << image.encoding() << ") does not match stream header ("
+                                      << _image_header.encoding.to_string() << ")" );
 
-    raw_image.encoding() = _image_header.encoding.to_string();
-    raw_image.height() = _image_header.height;
-    raw_image.width() = _image_header.width;
-    raw_image.step() = uint32_t( image.raw_data.size() / _image_header.height );
+    if( ! image.step() )
+        image.set_step( uint32_t( image.raw().data().size() / image.height() ) );
 
-    raw_image.is_bigendian() = false;
+    assert( ! image.is_bigendian() );
 
-    raw_image.data() = std::move( image.raw_data );
-
-    LOG_DEBUG( "publishing '" << name() << "' " << raw_image.encoding() << " frame @ " << time_to_string( image.timestamp ) );
-    DDS_API_CALL( _writer->get()->write( &raw_image ) );
+    LOG_DEBUG( "publishing '" << name() << "' " << image.encoding() << " frame @ " << time_to_string( image.timestamp() ) );
+    DDS_API_CALL( _writer->get()->write( &image.raw() ) );
 }
 
 
@@ -253,5 +258,58 @@ void dds_motion_stream_server::publish_motion( topics::imu_msg && imu )
 
     imu.write_to( *_writer );
 }
+
+
+dds_inference_stream_server::dds_inference_stream_server( std::string const & stream_name,
+                                                          std::string const & sensor_name )
+    : dds_stream_server( stream_name, sensor_name )
+{
+}
+
+
+void dds_inference_stream_server::check_profile( std::shared_ptr< dds_stream_profile > const & profile ) const
+{
+    super::check_profile( profile );
+    if( ! std::dynamic_pointer_cast< dds_inference_stream_profile >( profile ) )
+        DDS_THROW( runtime_error, "profile '" + profile->to_string() + "' is not an inference profile" );
+}
+
+
+void dds_inference_stream_server::open( std::string const & topic_name,
+                                        std::shared_ptr< dds_publisher > const & publisher )
+{
+    if( is_open() )
+        DDS_THROW( runtime_error, "stream '" + name() + "' is already open" );
+    if( profiles().empty() )
+        DDS_THROW( runtime_error, "stream '" + name() + "' has no profiles" );
+
+    auto topic = topics::string_msg::create_topic( publisher->get_participant(), topic_name.c_str() );
+    _writer = std::make_shared< dds_topic_writer >( topic, publisher );
+
+    run_stream();
+}
+
+
+void dds_inference_stream_server::start_streaming()
+{
+    super::start_streaming();
+}
+
+
+void dds_inference_stream_server::publish_inference( topics::string_msg const & msg )
+{
+    if( ! is_streaming() )
+        DDS_THROW( runtime_error, "stream '" + name() + "' cannot publish before start_streaming()" );
+
+    msg.write_to( *_writer );
+}
+
+
+dds_object_detection_stream_server::dds_object_detection_stream_server( std::string const & stream_name,
+                                                                          std::string const & sensor_name )
+    : super( stream_name, sensor_name )
+{
+}
+
 
 }  // namespace realdds

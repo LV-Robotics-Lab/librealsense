@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2019 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2019 RealSense, Inc. All Rights Reserved.
 
 #include "color-formats-converter.h"
 
@@ -13,10 +13,12 @@
 
 #ifdef RS2_USE_CUDA
 #include "cuda/cuda-conversion.cuh"
+#include "rsutils/accelerators/gpu.h"
 #endif
 #ifdef __SSSE3__
 #include <tmmintrin.h> // For SSSE3 intrinsics
 #endif
+#include "neon/image-neon.h"
 
 #if defined (ANDROID) || (defined (__linux__) && !defined (__x86_64__)) || (defined (__APPLE__) && !defined (__x86_64__))
 
@@ -44,6 +46,9 @@ bool has_avx()
 
 #endif
 
+// explanations for converting YUV values to RGB can be found in:
+// https://en.wikipedia.org/wiki/YUV#Y%E2%80%B2UV444_to_RGB888_conversion
+
 namespace librealsense 
 {
     /////////////////////////////
@@ -56,8 +61,11 @@ namespace librealsense
         auto n = width * height;
         assert(n % 16 == 0); // All currently supported color resolutions are multiples of 16 pixels. Could easily extend support to other resolutions by copying final n<16 pixels into a zero-padded buffer and recursively calling self for final iteration.
 #ifdef RS2_USE_CUDA
-        rscuda::unpack_yuy2_cuda<FORMAT>(d, s, n);
-        return;
+        if (rsutils::rs2_is_cuda_available())
+        {
+            rscuda::unpack_yuy2_cuda<FORMAT>(d, s, n);
+            return;
+        }
 #endif
 #if defined __SSSE3__ && ! defined ANDROID
         static bool do_avx = has_avx();
@@ -220,6 +228,16 @@ namespace librealsense
                 }
             }
         }
+
+#elif defined(__ARM_NEON) && defined(BUILD_WITH_NEON) && !defined(ANDROID)
+
+        if (FORMAT == RS2_FORMAT_Y8) unpack_yuy2_neon_y8(d, s, n);
+        if (FORMAT == RS2_FORMAT_Y16) unpack_yuy2_neon_y16(d, s, n);
+        if (FORMAT == RS2_FORMAT_RGB8) unpack_yuy2_neon_rgb8(d, s, n);
+        if (FORMAT == RS2_FORMAT_RGBA8) unpack_yuy2_neon_rgba8(d, s, n);
+        if (FORMAT == RS2_FORMAT_BGR8) unpack_yuy2_neon_bgr8(d, s, n);
+        if (FORMAT == RS2_FORMAT_BGRA8) unpack_yuy2_neon_bgra8(d, s, n);
+
 #else  // Generic code for when SSSE3 is not available.
         auto src = reinterpret_cast<const uint8_t *>(s);
         auto dst = reinterpret_cast<uint8_t *>(d[0]);
@@ -471,7 +489,7 @@ namespace librealsense
     // source_chunks_y  // yyyyyyyyyyyyyyyy
     // source_chunks_uv // uvuvuvuvuvuvuvuv
     // Each coupling is done as: 2 bytes of y coupled with 2 bytes of uv (one u, and one v)
-    template<rs2_format FORMAT>
+    template<rs2_format FORMAT> 
     void m420_sse_parse_one_line(const __m128i* source_chunks_y, const __m128i* source_chunks_uv, __m128i* dst, int line_length)
     {
 #pragma omp parallel for
@@ -491,13 +509,11 @@ namespace librealsense
             __m128i u16__8_F = _mm_unpackhi_epi8(u, zero);                         // convert to 16 bit
             __m128i v16__0_7 = _mm_unpacklo_epi8(v, zero);                         // convert to 16 bit
             __m128i v16__8_F = _mm_unpackhi_epi8(v, zero);                         // convert to 16 bit
-
             const __m128i n100 = _mm_set1_epi16(100 << 4);
             const __m128i n208 = _mm_set1_epi16(208 << 4);
             const __m128i n298 = _mm_set1_epi16(298 << 4);
             const __m128i n409 = _mm_set1_epi16(409 << 4);
             const __m128i n516 = _mm_set1_epi16(516 << 4);
-
             __m128i c16__0_7 = _mm_slli_epi16(_mm_subs_epi16(y16__0_7, _mm_set1_epi16(16)), 4);
             __m128i d16__0_7 = _mm_slli_epi16(_mm_subs_epi16(u16__0_7, _mm_set1_epi16(128)), 4); // perhaps could have done these u,v to d,e before the duplication
             __m128i e16__0_7 = _mm_slli_epi16(_mm_subs_epi16(v16__0_7, _mm_set1_epi16(128)), 4);
@@ -505,14 +521,12 @@ namespace librealsense
             __m128i g16__0_7 = _mm_min_epi16(_mm_set1_epi16(255), _mm_max_epi16(zero, ((_mm_sub_epi16(_mm_sub_epi16(_mm_mulhi_epi16(c16__0_7, n298), _mm_mulhi_epi16(d16__0_7, n100)), _mm_mulhi_epi16(e16__0_7, n208)))))); // (298 * c - 100 * d - 208 * e + 128)
             __m128i b16__0_7 = _mm_min_epi16(_mm_set1_epi16(255), _mm_max_epi16(zero, ((_mm_add_epi16(_mm_mulhi_epi16(c16__0_7, n298), _mm_mulhi_epi16(d16__0_7, n516))))));                                                 // clampbyte((298 * c + 516 * d + 128) >> 8);
 
-            // Compute R, G, B values for second 8 pixels
             __m128i c16__8_F = _mm_slli_epi16(_mm_subs_epi16(y16__8_F, _mm_set1_epi16(16)), 4);
             __m128i d16__8_F = _mm_slli_epi16(_mm_subs_epi16(u16__8_F, _mm_set1_epi16(128)), 4); // perhaps could have done these u,v to d,e before the duplication
             __m128i e16__8_F = _mm_slli_epi16(_mm_subs_epi16(v16__8_F, _mm_set1_epi16(128)), 4);
             __m128i r16__8_F = _mm_min_epi16(_mm_set1_epi16(255), _mm_max_epi16(zero, ((_mm_add_epi16(_mm_mulhi_epi16(c16__8_F, n298), _mm_mulhi_epi16(e16__8_F, n409))))));                                                 // (298 * c + 409 * e + 128) ; //
             __m128i g16__8_F = _mm_min_epi16(_mm_set1_epi16(255), _mm_max_epi16(zero, ((_mm_sub_epi16(_mm_sub_epi16(_mm_mulhi_epi16(c16__8_F, n298), _mm_mulhi_epi16(d16__8_F, n100)), _mm_mulhi_epi16(e16__8_F, n208)))))); // (298 * c - 100 * d - 208 * e + 128)
             __m128i b16__8_F = _mm_min_epi16(_mm_set1_epi16(255), _mm_max_epi16(zero, ((_mm_add_epi16(_mm_mulhi_epi16(c16__8_F, n298), _mm_mulhi_epi16(d16__8_F, n516))))));                                                 // clampbyte((298 * c + 516 * d + 128) >> 8);
-
 
 
             if (FORMAT == RS2_FORMAT_RGB8 || FORMAT == RS2_FORMAT_RGBA8)
@@ -636,7 +650,6 @@ namespace librealsense
             for (int i = 0; i < 2 * width / 16; ++i)
             {
                 auto offset_to_current_2_y_lines_for_src = (3 * width * j) / 16;
-
                 source_chunks_y[i] = _mm_loadu_si128(&src[offset_to_current_2_y_lines_for_src + i]);
 
                 if (FORMAT == RS2_FORMAT_Y8)
@@ -663,7 +676,7 @@ namespace librealsense
                 }
 
                 auto offset_to_current_uv_line_for_src = offset_to_current_2_y_lines_for_src + 2 * width / 16;
-                if (i < width / 16)
+                if ( i < width / 16)
                     source_chunks_uv[i] = _mm_load_si128(&src[offset_to_current_uv_line_for_src + i]);
             }
 
@@ -727,7 +740,6 @@ namespace librealsense
             }
             return;
         }
-
         for (int k = 0; k < src_height; k += 3)
         {
             // fill the y_buffer and uv_buffer
@@ -798,6 +810,159 @@ namespace librealsense
             break;
         default:
             LOG_ERROR("Unsupported format for M420 conversion.");
+            break;
+        }
+    }
+
+    /////////////////////////////
+    // NV12 unpacking routines //
+    /////////////////////////////
+    // This templated function unpacks NV12 into Y8/Y16/RGB8/RGBA8/BGR8/BGRA8, depending on the compile-time parameter FORMAT.
+    // NV12 is a semi-planar YUV 4:2:0 format:
+    //   - Y plane: width*height bytes at offset 0 (one Y per pixel)
+    //   - UV plane: width*(height/2) bytes at offset width*height (interleaved U,V pairs at half resolution)
+    // Each pair of U,V values covers a 2x2 block of pixels.
+    // The per-line UV layout (UVUVUV...) is identical to M420, only the plane arrangement differs.
+    template<rs2_format FORMAT> void unpack_nv12( uint8_t * const d[], const uint8_t * s, int width, int height, int actual_size)
+    {
+        assert(width % 16 == 0);
+        assert(height % 2 == 0);
+
+#if defined __SSSE3__ && ! defined ANDROID
+        auto dst = reinterpret_cast<__m128i*>(d[0]);
+
+        // Y plane starts at offset 0, UV plane starts at offset width*height
+        auto y_plane = reinterpret_cast<const __m128i*>(s);
+        auto uv_plane = reinterpret_cast<const __m128i*>(s + width * height);
+
+#pragma omp parallel for
+        for (int j = 0; j < height / 2; ++j)
+        {
+            // Per-iteration buffers to avoid data races across threads
+            auto source_chunks_y = new __m128i[2 * width / 16];
+            auto source_chunks_uv = new __m128i[width / 16];
+
+            // Load 2 lines of Y from the Y plane
+            for (int i = 0; i < 2 * width / 16; ++i)
+            {
+                auto y_offset = (2 * j * width) / 16;
+                source_chunks_y[i] = _mm_loadu_si128(&y_plane[y_offset + i]);
+
+                if (FORMAT == RS2_FORMAT_Y8)
+                {
+                    auto dst_offset = (2 * width * j) / 16;
+                    _mm_storeu_si128(&dst[dst_offset + i], source_chunks_y[i]);
+                    continue;
+                }
+
+                if (FORMAT == RS2_FORMAT_Y16)
+                {
+                    auto bpp = 2;
+                    auto dst_offset = (2 * width * j) / 16 * bpp;
+                    const __m128i zero = _mm_set1_epi8(0);
+                    __m128i y16__0_7 = _mm_unpacklo_epi8(source_chunks_y[i], zero);
+                    __m128i y16__8_F = _mm_unpackhi_epi8(source_chunks_y[i], zero);
+                    __m128i y16_0_7_epi_16 = _mm_slli_epi16(y16__0_7, 8);
+                    __m128i y16_8_F_epi_16 = _mm_slli_epi16(y16__8_F, 8);
+                    _mm_storeu_si128(&dst[dst_offset + i * 2], y16_0_7_epi_16);
+                    _mm_storeu_si128(&dst[dst_offset + i * 2 + 1], y16_8_F_epi_16);
+                    continue;
+                }
+
+                // Load UV line from the UV plane (one UV row per pair of Y rows)
+                if ( i < width / 16)
+                {
+                    auto uv_offset = (j * width) / 16;
+                    source_chunks_uv[i] = _mm_loadu_si128(&uv_plane[uv_offset + i]);
+                }
+            }
+
+            if (FORMAT == RS2_FORMAT_RGB8 || FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGR8 || FORMAT == RS2_FORMAT_BGRA8)
+            {
+                int bpp = 3;
+                if (FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGRA8)
+                    bpp = 4;
+
+                auto offset_to_current_first_line_for_dst = (2 * width * j) / 16 * bpp;
+                auto offset_to_current_second_line_for_dst = offset_to_current_first_line_for_dst + width * bpp / 16;
+
+                auto line_length = width / 16;
+                auto first_line_y = source_chunks_y;
+                auto second_line_y = source_chunks_y + line_length;
+
+                m420_sse_parse_one_line<FORMAT>(first_line_y, source_chunks_uv, &dst[offset_to_current_first_line_for_dst], line_length);
+                m420_sse_parse_one_line<FORMAT>(second_line_y, source_chunks_uv, &dst[offset_to_current_second_line_for_dst], line_length);
+            }
+
+            delete[] source_chunks_y;
+            delete[] source_chunks_uv;
+        }
+
+#else
+        auto src = reinterpret_cast<const uint8_t*>(s);
+        auto dst = reinterpret_cast<uint8_t*>(d[0]);
+
+        // Y plane at offset 0, UV plane at offset width*height
+        auto y_start = src;
+        auto uv_start = src + width * height;
+
+        if (FORMAT == RS2_FORMAT_Y8)
+        {
+            // Just copy the entire Y plane
+            std::memcpy( dst, y_start, width * height );
+            return;
+        }
+        if (FORMAT == RS2_FORMAT_Y16)
+        {
+            for (int pix = 0; pix < width * height; pix += 16)
+            {
+                uint16_t y[16];
+                for (int i = 0; i < 16; ++i)
+                {
+                    y[i] = y_start[pix + i] << 8;
+                }
+                std::memcpy( dst, y, sizeof y );
+                dst += sizeof y;
+            }
+            return;
+        }
+        for (int j = 0; j < height; j += 2)
+        {
+            auto y_row0 = y_start + j * width;
+            auto y_row1 = y_start + (j + 1) * width;
+            auto uv_row = uv_start + (j / 2) * width;
+
+            m420_parse_one_line<FORMAT>(y_row0, uv_row, &dst, width);
+            m420_parse_one_line<FORMAT>(y_row1, uv_row, &dst, width);
+        }
+        return;
+#endif // __SSSE3__
+    }
+
+    void unpack_nv12(rs2_format dst_format, rs2_stream dst_stream, uint8_t * const d[], const uint8_t * s, int w, int h, int actual_size)
+    {
+        switch (dst_format)
+        {
+        case RS2_FORMAT_Y8:
+            unpack_nv12<RS2_FORMAT_Y8>(d, s, w, h, actual_size);
+            break;
+        case RS2_FORMAT_Y16:
+            unpack_nv12<RS2_FORMAT_Y16>(d, s, w, h, actual_size);
+            break;
+        case RS2_FORMAT_RGB8:
+            unpack_nv12<RS2_FORMAT_RGB8>(d, s, w, h, actual_size);
+            break;
+        case RS2_FORMAT_RGBA8:
+            unpack_nv12<RS2_FORMAT_RGBA8>(d, s, w, h, actual_size);
+            break;
+        case RS2_FORMAT_BGR8:
+            unpack_nv12<RS2_FORMAT_BGR8>(d, s, w, h, actual_size);
+            break;
+        case RS2_FORMAT_BGRA8:
+            unpack_nv12<RS2_FORMAT_BGRA8>(d, s, w, h, actual_size);
+            break;
+        default:
+            LOG_ERROR("Unsupported format for NV12 conversion.");
             break;
         }
     }
@@ -1078,11 +1243,17 @@ namespace librealsense
         if (uncompressed_rgb)
         {
             auto uncompressed_size = w * h * bpp;
+            if (uncompressed_size != actual_size)
+            {
+                LOG_WARNING( "MJPEG decode size mismatch. Expected " << actual_size << ", got "
+                                                                     << uncompressed_size );
+                uncompressed_size = std::min( uncompressed_size, actual_size );
+            }
             std::memcpy( dest[0], uncompressed_rgb, uncompressed_size );
             stbi_image_free(uncompressed_rgb);
         }
         else
-            LOG_ERROR("jpeg decode failed");
+            LOG_ERROR("mjpeg decode failed");
     }
 
     /////////////////////////////
@@ -1124,5 +1295,25 @@ namespace librealsense
     void m420_converter::process_function( uint8_t * const dest[], const uint8_t * source, int width, int height, int actual_size, int input_size)
     {
         unpack_m420(_target_format, _target_stream, dest, source, width, height, actual_size);
+    }
+
+    void nv12_converter::process_function( uint8_t * const dest[], const uint8_t * source, int width, int height, int actual_size, int input_size)
+    {
+        unpack_nv12(_target_format, _target_stream, dest, source, width, height, actual_size);
+    }
+
+    void uyvy_to_yuyv::process_function( uint8_t * const dest[], const uint8_t * source, int width, int height, int actual_size, int input_size)
+    {
+        auto in = reinterpret_cast< const uint16_t * >( source );
+        auto out = reinterpret_cast< uint16_t * >( dest[0] );
+
+        // Time measurments on Jetson yielded better results for the non-CUDA version
+    //#ifdef RS2_USE_CUDA
+        //if( rsutils::rs2_is_cuda_available() )
+        //    rscuda::uyvy_to_yuyv_cuda_helper( in, out, width * height );
+    //#else
+        for( size_t i = 0; i < width * height; ++i )
+            out[i] = ( ( in[i] >> 8 ) & 0x00FF ) | ( ( in[i] << 8 ) & 0xFF00 );
+    //#endif
     }
 }

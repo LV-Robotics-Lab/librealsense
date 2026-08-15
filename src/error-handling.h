@@ -1,9 +1,12 @@
 /* License: Apache 2.0. See LICENSE file in root directory. */
-/* Copyright(c) 2019 Intel Corporation. All Rights Reserved. */
+/* Copyright(c) 2019 RealSense, Inc. All Rights Reserved. */
 #pragma once
 
 #include "core/option-interface.h"
 #include <rsutils/concurrency/concurrency.h>
+
+#include <atomic>
+#include <memory>
 
 
 namespace librealsense
@@ -16,10 +19,12 @@ namespace librealsense
     {
     public:
         polling_error_handler(unsigned int poll_intervals_ms, std::shared_ptr<option> option,
+            std::weak_ptr<std::atomic<bool>> device_alive,
             std::shared_ptr<notifications_processor> processor, std::shared_ptr<notification_decoder> decoder);
         ~polling_error_handler();
 
-        polling_error_handler(const polling_error_handler& h);
+        polling_error_handler(const polling_error_handler &) = delete;
+        polling_error_handler & operator=(const polling_error_handler &) = delete;
 
         unsigned int get_polling_interval() const { return _poll_intervals_ms; }
 
@@ -32,6 +37,7 @@ namespace librealsense
         unsigned int _poll_intervals_ms;
         bool _silenced = false;
         std::shared_ptr<option> _option;
+        std::weak_ptr<std::atomic<bool>> _device_alive;
         std::shared_ptr < active_object<> > _active_object;
         std::weak_ptr<notifications_processor> _notifications_processor;
         std::shared_ptr<notification_decoder> _decoder;

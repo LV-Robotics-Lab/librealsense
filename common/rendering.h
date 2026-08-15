@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -59,7 +59,8 @@ namespace rs2
             : _counter(0),
             _delta(0),
             _last_timestamp(0),
-            _num_of_frames(0)
+            _num_of_frames(0),
+            _last_frame_counter(0)
         {}
 
         fps_calc(const fps_calc& other)
@@ -75,7 +76,7 @@ namespace rs2
             std::lock_guard<std::mutex> lock(_mtx);
             if (++_counter >= _skip_frames)
             {
-                if (_last_timestamp != 0)
+                if (_last_timestamp != 0 && frame_counter > _last_frame_counter)
                 {
                     _delta = timestamp - _last_timestamp;
                     _num_of_frames = frame_counter - _last_frame_counter;
@@ -90,7 +91,7 @@ namespace rs2
         double get_fps() const
         {
             std::lock_guard<std::mutex> lock(_mtx);
-            if (_delta == 0)
+            if (std::abs(_delta) < std::numeric_limits<double>::epsilon())
                 return 0;
 
             return (static_cast<double>(_numerator) * _num_of_frames) / _delta;
@@ -379,6 +380,10 @@ namespace rs2
         rsutils::time::stopwatch _t;
     };
 
+    // IMPORTANT: the destructor calls glDeleteTextures(), which requires a
+    // current OpenGL context. Owners must ensure a valid GL context is current
+    // at the point of destruction. See ux-window.cpp for the canonical pattern:
+    // an owned texture_buffer must be released *before* glfwDestroyWindow().
     class texture_buffer
     {
         GLuint texture;
@@ -387,20 +392,29 @@ namespace rs2
     public:
         std::shared_ptr<colorizer> colorize;
         std::shared_ptr<yuy_decoder> yuy2rgb;
+        std::shared_ptr<m420_decoder> m420_to_rgb;
+        std::shared_ptr<nv12_decoder> nv12_to_rgb;
         std::shared_ptr<y411_decoder> y411;
         bool zoom_preview = false;
         rect curr_preview_rect{};
         int texture_id = 0;
 
-        texture_buffer(const texture_buffer& other)
-        {
-            texture = other.texture;
-        }
+        // Own the GL texture properly. Each Stop/Start cycle gc_streams destroys
+        // and recreates this object, so without a destructor the GL texture (and
+        // the driver-side allocation behind it) leaks every cycle.
+        // Copy/move deleted because shallow-copying `texture` would double-free.
+        texture_buffer( const texture_buffer & )             = delete;
+        texture_buffer & operator=( const texture_buffer & ) = delete;
+        texture_buffer( texture_buffer && )                  = delete;
+        texture_buffer & operator=( texture_buffer && )      = delete;
 
-        texture_buffer& operator=(const texture_buffer& other)
+        ~texture_buffer()
         {
-            texture = other.texture;
-            return *this;
+            if( texture )
+            {
+                glDeleteTextures( 1, &texture );
+                texture = 0;
+            }
         }
 
         rs2::frame get_last_frame(bool with_texture = false) const {
@@ -476,32 +490,16 @@ namespace rs2
             // Allow upload of points frame type
             if (auto pc = frame.as<points>())
             {
-                if (!frame.is<gl::gpu_frame>())
-                {
-                    // Points can be uploaded as two different
-                    // formats: XYZ for verteces and UV for texture coordinates
-                    if (prefered_format == RS2_FORMAT_XYZ32F)
-                    {
-                        // Upload vertices
-                        data = pc.get_vertices();
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, data);
-                    }
-                    else
-                    {
-                        // Upload texture coordinates
-                        data = pc.get_texture_coordinates();
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, width, height, 0, GL_RG, GL_FLOAT, data);
-                    }
-
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                }
-                else
-                {
-                    // Update texture_id based on desired format
-                    if (prefered_format == RS2_FORMAT_XYZ32F) texture_id = 0;
-                    else texture_id = 1;
-                }
+                upload_points(pc, width, height, prefered_format);
+            }
+            // Allow upload of labeled points frame type
+            else if (auto lpc = frame.as<labeled_points>())
+            {
+                upload_labeled_points(lpc, width, height);
+            }
+            else if (frame.get_profile().stream_type() == RS2_STREAM_OCCUPANCY)
+            {
+                upload_occupancy_frame(frame, data);
             }
             else
             {
@@ -510,7 +508,7 @@ namespace rs2
                 case RS2_FORMAT_ANY:
                     throw std::runtime_error("not a valid format");
                 case RS2_FORMAT_Z16H:
-                    throw std::runtime_error("unexpected format: Z16H. Check decoder processing block");
+                    throw std::runtime_error("unexpected format: Z16H is deprecated! Check decoder processing block");
                 case RS2_FORMAT_Z16:
                 case RS2_FORMAT_DISPARITY16:
                 case RS2_FORMAT_DISPARITY32:
@@ -573,6 +571,46 @@ namespace rs2
                     else
                     {
                         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, data);
+                    }
+                    break;
+                case RS2_FORMAT_M420:
+                    if (m420_to_rgb)
+                    {
+                        if (auto colorized_frame = m420_to_rgb->process(frame).as<video_frame>())
+                        {
+                            if (!colorized_frame.is<gl::gpu_frame>())
+                            {
+                                glBindTexture(GL_TEXTURE_2D, texture);
+                                data = colorized_frame.get_data();
+
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
+                                    colorized_frame.get_width(),
+                                    colorized_frame.get_height(),
+                                    0, GL_RGB, GL_UNSIGNED_BYTE,
+                                    colorized_frame.get_data());
+                            }
+                            rendered_frame = colorized_frame;
+                        }
+                    }
+                    break;
+                case RS2_FORMAT_NV12:
+                    if (nv12_to_rgb)
+                    {
+                        if (auto colorized_frame = nv12_to_rgb->process(frame).as<video_frame>())
+                        {
+                            if (!colorized_frame.is<gl::gpu_frame>())
+                            {
+                                glBindTexture(GL_TEXTURE_2D, texture);
+                                data = colorized_frame.get_data();
+
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
+                                    colorized_frame.get_width(),
+                                    colorized_frame.get_height(),
+                                    0, GL_RGB, GL_UNSIGNED_BYTE,
+                                    colorized_frame.get_data());
+                            }
+                            rendered_frame = colorized_frame;
+                        }
                     }
                     break;
                 case RS2_FORMAT_Y411:
@@ -693,6 +731,117 @@ namespace rs2
             glBindTexture(GL_TEXTURE_2D, 0);
 
             last_queue[1].enqueue(rendered_frame);
+        }
+
+        void upload_points(const points& pc, int width, int height, rs2_format prefered_format)
+        {
+            if (!pc.is<gl::gpu_frame>())
+            {
+                // Points can be uploaded as two different
+                // formats: XYZ for verteces and UV for texture coordinates
+                if (prefered_format == RS2_FORMAT_XYZ32F)
+                {
+                    // Upload vertices
+                    auto data = pc.get_vertices();
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, data);
+                }
+                else
+                {
+                    // Upload texture coordinates
+                    auto data = pc.get_texture_coordinates();
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, width, height, 0, GL_RG, GL_FLOAT, data);
+                }
+
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            }
+            else
+            {
+                // Update texture_id based on desired format
+                if (prefered_format == RS2_FORMAT_XYZ32F) texture_id = 0;
+                else texture_id = 1;
+            }
+        }
+
+        void upload_labeled_points(const labeled_points& lpc, int width, int height)
+        {
+            if (!lpc.is<gl::gpu_frame>())
+            {
+                // Upload vertices
+                auto data = lpc.get_vertices();
+                auto lpc_width = lpc.get_width();
+                auto lpc_height = lpc.get_height();
+
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, lpc_width, lpc_height, 0, GL_RGB, GL_FLOAT, (const void*)data);
+
+                // TODO: use of labels 
+                auto labels = lpc.get_labels();
+
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            }
+            else
+            {
+                texture_id = 1;
+            }
+        }
+
+        void upload_occupancy_frame(const rs2::frame &frame, const void *data)
+        {
+            if (!frame.supports_frame_metadata(RS2_FRAME_METADATA_OCCUPANCY_GRID_ROWS) ||
+                !frame.supports_frame_metadata(RS2_FRAME_METADATA_OCCUPANCY_GRID_COLUMNS))
+                throw std::runtime_error("Occupancy rows / columns could not be read from frame metadata");
+
+            auto occup_cols = static_cast<int>(frame.get_frame_metadata(RS2_FRAME_METADATA_OCCUPANCY_GRID_COLUMNS)); // width
+            auto occup_rows = static_cast<int>(frame.get_frame_metadata(RS2_FRAME_METADATA_OCCUPANCY_GRID_ROWS));    // height
+
+
+            // Using look up table to make the following operation faster
+            // Pre-computed lookup table for bit expansion
+            // Example: For byte value 0b10110001 (177)
+            // lut[177] = { 0xFF,  0x00,  0x00,  0x00,  0xFF,  0xFF,  0x00,  0xFF }
+            //              bit0   bit1   bit2   bit3   bit4   bit5   bit6   bit7
+            // Then the below line "std::memcpy(&vec[i * 8], expanded.data(), 8);"
+            // grabs 8 values at once from the LUT instead of calculating each bit one by one
+            static const std::array<std::array<uint8_t, 8>, 256> bit_expand_lut = []() {
+                std::array<std::array<uint8_t, 8>, 256> lut;
+                for (int byte_val = 0; byte_val < 256; ++byte_val) {
+                    for (int bit = 0; bit < 8; ++bit) {
+                        lut[byte_val][bit] = ((byte_val >> bit) & 1) ? 0xFF : 0;
+                    }
+                }
+                return lut;
+                }();
+
+            // We want to reverse the data's bit, because AICV algo is packing each 8 cells into one byte, but in an opposite order
+            // than we (and OpenGL) expect. The rightest bit (LSB) inside the packed byte from AICV algo represents the first bit we want to draw from this byte
+            // e.g. Occupancy Cells: 0 0 1 1 0 0 1 0 ---> AICV packing algo ---> bytes[i] = 01001100. The order is reversed, so we reverse it again.
+            // Each byte represents 8 cells (1 bit <==> 1 cell), therefore the size is ==> rows(height) * cols(width) / 8
+
+            std::vector<uint8_t> vec(occup_rows * occup_cols);
+            uint8_t *byte_array = (uint8_t *)data;
+
+            for (int i = 0; i < occup_rows * occup_cols / 8; i++)
+            {
+                const auto& expanded = bit_expand_lut[byte_array[i]];
+                std::memcpy(&vec[i * 8], expanded.data(), 8);
+            }
+
+            // Default alignment is 4 byte on windows, store it and work with 1 as our grid columns are not a multiple of 4
+            GLint unpackAlignment;
+            glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpackAlignment);
+
+            // Change alignment to 1
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+            // Render
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, occup_cols, occup_rows, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, vec.data());
+
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+            // Restore default alignment
+            glPixelStorei(GL_UNPACK_ALIGNMENT, unpackAlignment);
         }
 
         static void  draw_axes(float axis_size = 1.f, float axisWidth = 4.f)
@@ -1126,6 +1275,7 @@ namespace rs2
             case RS2_FORMAT_XYZ32F:
             case RS2_FORMAT_MOTION_RAW:
             case RS2_FORMAT_MOTION_XYZ32F:
+            case RS2_FORMAT_COMBINED_MOTION:
             case RS2_FORMAT_GPIO_RAW:
             case RS2_FORMAT_6DOF:
                 return false;

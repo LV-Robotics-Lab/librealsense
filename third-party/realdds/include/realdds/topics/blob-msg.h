@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023-4 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include "blob/blob.h"
@@ -8,15 +8,7 @@
 #include <string>
 #include <memory>
 #include <vector>
-
-
-namespace eprosima {
-namespace fastdds {
-namespace dds {
-struct SampleInfo;
-}
-}  // namespace fastdds
-}  // namespace eprosima
+#include <functional>
 
 
 namespace udds {
@@ -63,10 +55,16 @@ public:
     //
     static bool take_next( dds_topic_reader &,
                            blob_msg * output,
-                           eprosima::fastdds::dds::SampleInfo * optional_info = nullptr );
+                           dds_sample * optional_sample = nullptr );
 
     // Returns some unique (to the writer) identifier for the sample that was sent, or 0 if unsuccessful
     dds_sequence_number write_to( dds_topic_writer & ) const;
+
+    // Same as write_to() but allows stopping the send process.
+    // This requires the writer to be configured with ASYNCHRONOUS_PUBLISH_MODE so that write() returns immediately
+    // and the actual sending is done in the background. We then wait for acknowledgments in a loop, checking 'should_stop'.
+    // If 'should_stop' returns true, or timeout expires, the history is cleared (aborting the send) and 0 is returned.
+    dds_sequence_number write_to( dds_topic_writer &, double timeout, std::function< bool() > should_stop ) const;
 
     // Cast the raw data to the desired type
     template< typename T >

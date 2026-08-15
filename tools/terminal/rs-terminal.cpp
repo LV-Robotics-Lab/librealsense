@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015-24 RealSense, Inc. All Rights Reserved.
 
 #include <iostream>
 #include <fstream>
@@ -8,7 +8,7 @@
 
 #include <librealsense2/rs.hpp>
 #include <rsutils/string/string-utilities.h>
-#include "tclap/CmdLine.h"
+#include <common/cli.h>
 #include "parser.hpp"
 #include "auto-complete.h"
 
@@ -17,7 +17,6 @@
 
 
 using namespace std;
-using namespace TCLAP;
 using rsutils::json;
 
 
@@ -42,7 +41,7 @@ vector<uint8_t> build_raw_command_data(const command& command, const vector<stri
     return raw_data;
 }
 
-void xml_mode(const string& line, const commands_xml& cmd_xml, rs2::device& dev, map<string, xml_parser_function>& format_type_to_lambda)
+void xml_mode(const string& line, const commands_xml& cmd_xml, rs2::device& dev, map<string, xml_parser_function>& format_type_to_lambda, bool verbose = false)
 {
     vector<string> tokens;
     stringstream ss(line);
@@ -72,13 +71,27 @@ void xml_mode(const string& line, const commands_xml& cmd_xml, rs2::device& dev,
 
     auto raw_data = build_raw_command_data(command, params);
 
-    for (auto b : raw_data)
+    // Print raw command if verbose mode is enabled
+    if (verbose)
     {
-        cout << hex << fixed << setfill('0') << setw(2) << (int)b << " ";
+        cout << "RAW Command:  ";
+        for (auto b : raw_data)
+        {
+            cout << hex << fixed << setfill('0') << setw(2) << (int)b << " ";
+        }
+        cout << endl;
     }
-    cout << endl;
 
     auto result = dev.as<rs2::debug_protocol>().send_and_receive_raw_data(raw_data);
+
+    // Print raw response if verbose mode is enabled
+    if (verbose)
+    {
+        cout << "RAW Response: ";
+        for (auto& elem : result)
+            cout << setfill('0') << setw(2) << hex << static_cast<int>(elem) << " ";
+        cout << endl;
+    }
 
     unsigned returned_opcode = *result.data();
     // check returned opcode
@@ -165,17 +178,16 @@ rs2::device wait_for_device(const rs2::device_hub& hub, bool print_info = true)
 
 int main(int argc, char** argv) try
 {
-    CmdLine cmd("librealsense rs-terminal tool", ' ', RS2_API_FULL_VERSION_STR);
-    SwitchArg debug_arg( "", "debug", "Turn on LibRS debug logs" );
-    ValueArg<string> xml_arg("l", "load", "Full file path of commands XML file", false, "", "Load commands XML file");
-    ValueArg<int> device_id_arg("d", "deviceId", "Device ID could be obtain from rs-enumerate-devices example", false, 0, "Select a device to work with");
-    ValueArg<string> specific_SN_arg("n", "serialNum", "Serial Number can be obtain from rs-enumerate-devices example", false, "", "Select a device serial number to work with");
-    SwitchArg all_devices_arg("a", "allDevices", "Do this command to all attached Realsense Devices", false);
-    ValueArg<string> hex_cmd_arg("s", "send", "Hexadecimal raw data", false, "", "Send hexadecimal raw data to device");
-    ValueArg<string> hex_script_arg("r", "raw", "Full file path of hexadecimal raw data script", false, "", "Send raw data line by line from script file");
-    ValueArg<string> commands_script_arg("c", "cmd", "Full file path of commands script", false, "", "Send commands line by line from script file");
-    SwitchArg only_sw_arg( "", "sw-only", "Show only software devices (playback, DDS, etc. -- but not USB/HID/etc.)" );
-    cmd.add(debug_arg);
+    using cli = rs2::cli;
+    cli cmd( "librealsense rs-terminal tool" );
+    cli::value<string> xml_arg('l', "load", "path", "", "Full commands XML file path");
+    cli::value<int> device_id_arg('d', "deviceId", "", 0, "Device ID can be obtained from rs-enumerate-devices");
+    cli::value<string> specific_SN_arg('n', "serialNum", "serial-number", "", "Serial Number can be obtain from rs-enumerate-devices example");
+    cli::flag all_devices_arg('a', "allDevices", "Do this command to all attached Realsense Devices");
+    cli::value<string> hex_cmd_arg('s', "send", "hex-data", "", "Hexadecimal raw data");
+    cli::value<string> hex_script_arg('r', "raw", "path", "", "Full file path of hexadecimal raw data script");
+    cli::value<string> commands_script_arg('c', "cmd", "path", "", "Full file path of commands script");
+    cli::flag verbose_arg('v', "verbose", "Print raw data buffers");
     cmd.add(xml_arg);
     cmd.add(device_id_arg);
     cmd.add(specific_SN_arg);
@@ -183,52 +195,16 @@ int main(int argc, char** argv) try
     cmd.add(hex_cmd_arg);
     cmd.add(hex_script_arg);
     cmd.add(commands_script_arg);
-    cmd.add(only_sw_arg);
-#ifdef BUILD_WITH_DDS
-    ValueArg< int > domain_arg( "", "dds-domain", "Set the DDS domain ID (default to 0)", false, 0, "0-232" );
-    cmd.add( domain_arg );
-#endif
-    cmd.parse(argc, argv);
-
-#ifdef BUILD_EASYLOGGINGPP
-    bool debugging = debug_arg.getValue();
-    rs2::log_to_console( debugging ? RS2_LOG_SEVERITY_DEBUG : RS2_LOG_SEVERITY_ERROR );
-#endif
+    cmd.add(verbose_arg);
+    auto settings = cmd.process( argc, argv );
 
     // parse command.xml
     rs2::log_to_file(RS2_LOG_SEVERITY_WARN, "librealsense.log");
-
-    json settings = json::object();
-#ifdef BUILD_WITH_DDS
-    if( domain_arg.isSet() || only_sw_arg.isSet() )
-    {
-        json dds = json::object();
-        if( domain_arg.isSet() )
-            dds["domain"] = domain_arg.getValue();
-        dds["enabled"];  // null: remove global dds:false or dds/enabled:false, if any
-        settings["dds"] = std::move( dds );
-    }
-#endif
-    if( only_sw_arg.getValue() )
-        settings["device-mask"] = RS2_PRODUCT_LINE_SW_ONLY | RS2_PRODUCT_LINE_ANY;
 
     // Obtain a list of devices currently present on the system
     rs2::context ctx( settings.dump() );
     rs2::device_hub hub(ctx);
     rs2::device_list all_device_list = ctx.query_devices();
-    if( only_sw_arg.getValue() )
-    {
-        // For SW-only devices, allow some time for DDS devices to connect
-        int tries = 5;
-        cout << "No device detected. Waiting..." << flush;
-        while( ! all_device_list.size() && tries-- )
-        {
-            cout << "." << flush;
-            std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
-            all_device_list = ctx.query_devices();
-        }
-        cout << endl;
-    }
     if (all_device_list.size() == 0) {
         std::cout << "\nLibrealsense is not detecting any devices" << std::endl;
         return EXIT_FAILURE;
@@ -236,20 +212,13 @@ int main(int argc, char** argv) try
 
     std::vector<rs2::device> rs_device_list;
     // Ensure that deviceList only has realsense devices in it. tmpList contains webcams as well
-    if( only_sw_arg.getValue() )
-    {
-        rs_device_list = all_device_list;
-    }
-    else
-    {
-        for (uint32_t i = 0; i < all_device_list.size(); i++) {
-            try {
-                all_device_list[i].get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION);
-                rs_device_list.push_back(all_device_list[i]);
-            }
-            catch (...) {
-                continue;
-            }
+    for (uint32_t i = 0; i < all_device_list.size(); i++) {
+        try {
+            all_device_list[i].get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION);
+            rs_device_list.push_back(all_device_list[i]);
+        }
+        catch (...) {
+            continue;
         }
     }
     auto num_rs_devices = rs_device_list.size();
@@ -408,7 +377,7 @@ int main(int argc, char** argv) try
                 try
                 {
                     for (auto& elem : script_lines)
-                        xml_mode(elem, cmd_xml, dev, format_type_to_lambda);
+                        xml_mode(elem, cmd_xml, dev, format_type_to_lambda, verbose_arg.isSet());
                 }
                 catch (const exception& ex)
                 {
@@ -453,7 +422,7 @@ int main(int argc, char** argv) try
                     }
                     else
                     {
-                        xml_mode(line, cmd_xml, dev, format_type_to_lambda);
+                        xml_mode(line, cmd_xml, dev, format_type_to_lambda, verbose_arg.isSet());
                     }
                     cout << endl;
                 }

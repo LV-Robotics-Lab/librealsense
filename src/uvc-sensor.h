@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -31,6 +31,16 @@ public:
     virtual void prepare_for_bulk_operation() override;
     virtual void finished_bulk_operation() override;
 
+    // Lets the owning device override the SDK stream type/index derived for a raw backend profile.
+    // Needed when several pins expose identical {w,h,fps,format} and must become distinct SDK streams.
+    // The resolver receives the full backend profile list (so it can classify a pin by its companion formats),
+    // the profile being resolved, and the type/index to adjust in place.
+    using stream_id_resolver = std::function< void( const std::vector< platform::stream_profile > & all_profiles,
+                                                     const platform::stream_profile & profile,
+                                                     rs2_stream & type,
+                                                     int & index ) >;
+    void set_stream_id_resolver( stream_id_resolver resolver ) { _stream_id_resolver = std::move( resolver ); }
+
     std::vector< platform::stream_profile > get_configuration() const { return _internal_config; }
     std::shared_ptr< platform::uvc_device > get_uvc_device() { return _device; }
     platform::usb_spec get_usb_specification() const { return _device->get_usb_specification(); }
@@ -43,6 +53,20 @@ public:
         return action( *_device );
     }
 
+    
+    void power_for_duration( std::chrono::steady_clock::duration timeout = std::chrono::milliseconds( 500 ) )
+    {
+        acquire_power();
+        std::weak_ptr< uvc_sensor > weak = std::dynamic_pointer_cast< uvc_sensor >( shared_from_this() );
+        std::thread release_power_thread( [weak, timeout]()
+        {
+            std::this_thread::sleep_for( timeout );
+            if( auto strong = weak.lock() )
+                strong->release_power();
+        } );
+        release_power_thread.detach();
+    }
+
 protected:
     stream_profiles init_stream_profiles() override;
     void verify_supported_requests( const stream_profiles & requests ) const;
@@ -51,6 +75,9 @@ private:
     void acquire_power();
     void release_power();
     void reset_streaming();
+    std::atomic<int64_t> _gyro_counter;
+    std::atomic<int64_t> _accel_counter;
+
 
     struct power
     {
@@ -83,6 +110,7 @@ private:
     };
 
     std::shared_ptr< platform::uvc_device > _device;
+    stream_id_resolver _stream_id_resolver;
     std::vector< platform::stream_profile > _internal_config;
     std::atomic< int > _user_count;
     std::mutex _power_lock;

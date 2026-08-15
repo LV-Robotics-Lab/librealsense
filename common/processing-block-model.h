@@ -1,9 +1,10 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2024 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2024 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
 #include <librealsense2/rs.hpp>
+#include <functional>
 #include <string>
 
 
@@ -42,6 +43,10 @@ namespace rs2
 
         std::shared_ptr<rs2::filter> get_block() { return _block; }
 
+        // Access the UI model for one of this block's options (nullptr if not present).
+        // Used by the viewer UI tests to drive/read post-processing filter controls.
+        option_model * get_option_model( rs2_option opt );
+
         void enable( bool e = true )
         {
             processing_block_enable_disable( _enabled = e );
@@ -49,6 +54,15 @@ namespace rs2
         bool is_enabled() const { return _enabled; }
 
         bool visible = true;
+
+        // Optional predicate; null means always available.
+        // When it returns false the toggle is grayed out in the UI.
+        // Set by the owner after construction for filters with runtime constraints
+        // (e.g. in subdevice_model for Improved Close Range Depth: requires CUDA and specific stream config).
+        std::function<bool()> available;
+        std::string unavailable_tooltip;
+
+        bool is_available() const { return !available || available(); }
 
         // Callback when our state changes
         // NOTE: actual may not be same as is_enabled()! The latter is this particular pb,
@@ -58,12 +72,15 @@ namespace rs2
     protected:
         bool _enabled = true;
         std::shared_ptr<rs2::filter> _block;
-        std::map< rs2_option, option_model > options_metadata;
+        std::map< rs2_option, option_model > _options_id_to_model;
         std::string _name;
         std::string _full_name;
         std::function<rs2::frame( rs2::frame )> _invoker;
         subdevice_model* _owner;
     };
+
+    bool restore_processing_block(const char* name,
+        std::shared_ptr<rs2::processing_block> pb, bool enable);
 
     void save_processing_block_to_config_file(const char* name,
         std::shared_ptr<rs2::processing_block> pb, bool enable = true);

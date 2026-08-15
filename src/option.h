@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include "core/option-interface.h"
@@ -37,7 +37,7 @@ namespace librealsense
         std::vector<std::function<void(float)>> _callbacks;
     };
 
-    class readonly_option : public option
+    class readonly_option : virtual public option
     {
     public:
         bool is_read_only() const override { return true; }

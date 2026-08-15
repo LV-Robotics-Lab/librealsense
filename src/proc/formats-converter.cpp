@@ -1,11 +1,12 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023-4 RealSense, Inc. All Rights Reserved.
 
 #include "proc/formats-converter.h"
 #include "stream.h"
 #include <src/composite-frame.h>
 #include <src/core/frame-callback.h>
 
+#include <rsutils/string/from.h>
 #include <ostream>
 
 namespace librealsense
@@ -73,15 +74,18 @@ std::ostream & operator<<( std::ostream & os, const std::shared_ptr< stream_prof
 {
     if( profile )
     {
-        os << "(" << rs2_stream_to_string( profile->get_stream_type() ) << ")";
-        os << " " << rs2_format_to_string( profile->get_format() );
-        os << " " << profile->get_stream_index();
+        os << rs2_stream_to_string( profile->get_stream_type() );
+        if( auto stream_index = profile->get_stream_index() )
+            os << " " << stream_index;
         if( auto vsp = As< video_stream_profile, stream_profile_interface >( profile ) )
         {
             os << " " << vsp->get_width();
             os << "x" << vsp->get_height();
         }
-        os << " @ " << profile->get_framerate();
+        os << " " << rs2_format_to_string( profile->get_format() );
+        os << " @ " << profile->get_framerate() << " Hz";
+        if( auto bsp = std::dynamic_pointer_cast< backend_stream_profile >( profile ) )
+            bsp->to_stream( os );
     }
 
     return os;
@@ -97,7 +101,7 @@ stream_profiles formats_converter::get_all_possible_profiles( const stream_profi
 
     for( auto & raw_profile : raw_profiles )
     {
-        LOG_DEBUG( "Raw profile: " << raw_profile );
+        //LOG_DEBUG( "Raw profile: " << raw_profile );
         for( auto & pbf : _pb_factories )
         {
             const auto & sources = pbf->get_source_info();
@@ -109,16 +113,22 @@ stream_profiles formats_converter::get_all_possible_profiles( const stream_profi
                     // targets are saved with format, type and sometimes index. Updating fps and resolution before using as key
                     for( const auto & target : pbf->get_target_info() )
                     {
-                        // When interleaved streams are seperated to two distinct streams (e.g. sent as DDS streams),
-                        // same converters are registered for both streams. We handle the relevant one based on index.
-                        // Currently for infrared streams only.
-                        if( source.stream == RS2_STREAM_INFRARED && raw_profile->get_stream_index() != target.index )
+                        // When a converter declares multiple indexed targets for one source stream (e.g. interleaved
+                        // infrared split into IR1/IR2, or the two color pins routed to Color 1/2), match each raw
+                        // profile to the target whose index equals the raw stream index.
+                        if( ( source.stream == RS2_STREAM_INFRARED || source.stream == RS2_STREAM_COLOR )
+                            && raw_profile->get_stream_index() != target.index )
                             continue;
 
-                        auto cloned_profile = clone_profile( raw_profile );
+                        auto cloned_profile = clone_profile( raw_profile, target.stream );
                         cloned_profile->set_format( target.format );
                         cloned_profile->set_stream_index( target.index );
                         cloned_profile->set_stream_type( target.stream );
+                        // UVC raw profile name is not set, default name can be created based on type and index, but raw UVC index is always 0.
+                        // Use temporary variable to generate name without changing original raw_profile object.
+                        auto && tmp_raw_profile = std::dynamic_pointer_cast< stream_profile_base >( raw_profile ).get();
+                        tmp_raw_profile->set_stream_index( target.index );
+                        cloned_profile->set_name( tmp_raw_profile->get_name() );
 
                         auto cloned_vsp = As< video_stream_profile, stream_profile_interface >( cloned_profile );
                         if( cloned_vsp )
@@ -129,7 +139,7 @@ stream_profiles formats_converter::get_all_possible_profiles( const stream_profi
                             target.resolution_transform( width, height );
                             cloned_vsp->set_dims( width, height );
                         }
-                        LOG_DEBUG( "          -> " << cloned_profile );
+                        //LOG_DEBUG( "          -> " << cloned_profile );
 
                         // Cache pbf supported profiles for efficiency in find_pbf_matching_most_profiles
                         _pbf_supported_profiles[pbf.get()].push_back( cloned_profile );
@@ -163,13 +173,22 @@ stream_profiles formats_converter::get_all_possible_profiles( const stream_profi
 }
 
 std::shared_ptr< stream_profile_interface >
-formats_converter::clone_profile( const std::shared_ptr< stream_profile_interface > & raw_profile ) const
+formats_converter::clone_profile( const std::shared_ptr< stream_profile_interface > & raw_profile,
+                                  rs2_stream target_stream ) const
 {
     std::shared_ptr< stream_profile_interface > cloned = nullptr;
 
-    auto vsp = std::dynamic_pointer_cast< video_stream_profile >( raw_profile );
-    auto msp = std::dynamic_pointer_cast< motion_stream_profile >( raw_profile );
-    if( vsp )
+    // Inference streams (e.g. object detection) carry a variable-length binary payload rather than
+    // an image. When the target stream is inference, produce an inference_stream_profile regardless
+    // of the raw profile's type, so record/playback take the inference path and dims are not advertised.
+    if( target_stream == RS2_STREAM_OBJECT_DETECTION
+        && ! std::dynamic_pointer_cast< inference_stream_profile >( raw_profile ) )
+    {
+        cloned = std::make_shared< inference_stream_profile >();
+        if( ! cloned )
+            throw librealsense::invalid_value_exception( "failed to clone profile" );
+    }
+    else if( auto vsp = std::dynamic_pointer_cast< video_stream_profile >( raw_profile ) )
     {
         cloned = std::make_shared< video_stream_profile >();
         if( ! cloned )
@@ -182,7 +201,7 @@ formats_converter::clone_profile( const std::shared_ptr< stream_profile_interfac
         // There is a default implementation throwing if no other function is set.
         // video_clone->set_intrinsics( [vsp]() { return vsp->get_intrinsics(); } );
     }
-    else if( msp )
+    else if( auto msp = std::dynamic_pointer_cast< motion_stream_profile >( raw_profile ) )
     {
         cloned = std::make_shared< motion_stream_profile >();
         if( ! cloned )
@@ -190,6 +209,12 @@ formats_converter::clone_profile( const std::shared_ptr< stream_profile_interfac
 
         auto motion_clone = std::dynamic_pointer_cast< motion_stream_profile >( cloned );
         // motion_clone->set_intrinsics( [msp]() { return msp->get_intrinsics(); } );
+    }
+    else if( auto isp = std::dynamic_pointer_cast< inference_stream_profile >( raw_profile ) )
+    {
+        cloned = std::make_shared< inference_stream_profile >();
+        if( ! cloned )
+            throw librealsense::invalid_value_exception( "failed to clone profile" );
     }
     else
         throw librealsense::not_implemented_exception( "Unsupported profile type to clone" );
@@ -222,6 +247,7 @@ bool formats_converter::is_profile_in_list( const std::shared_ptr< stream_profil
 // Not passing const & because we modify from_profiles, would otherwise need to create a copy
 void formats_converter::prepare_to_convert( stream_profiles from_profiles )
 {
+    LOG_DEBUG( "Requested: " << from_profiles );
     clear_active_cache();
 
     // Add missing data to target profiles (was not available during get_all_possible_target_profiles)
@@ -264,9 +290,21 @@ void formats_converter::prepare_to_convert( stream_profiles from_profiles )
             }
         }
         const stream_profiles & print_current_resolved_reqs = { current_resolved_reqs.begin(), current_resolved_reqs.end() };
-        LOG_INFO( "Request: " << from_profiles_of_best_match << "\nResolved to: " << print_current_resolved_reqs );
+        LOG_DEBUG( "Resolved to: " << print_current_resolved_reqs );
     }
 }
+
+
+stream_profiles const & formats_converter::get_source_profiles_from_target(
+    std::shared_ptr< stream_profile_interface > const & target_profile ) const
+{
+    auto it = _target_profiles_to_raw_profiles.find( to_profile( target_profile.get() ) );
+    if( it == _target_profiles_to_raw_profiles.end() )
+        throw invalid_value_exception( rsutils::string::from()
+                                       << "target profile [" << target_profile << "] not found" );
+    return it->second;
+}
+
 
 void formats_converter::update_target_profiles_data( const stream_profiles & from_profiles )
 {
@@ -279,14 +317,13 @@ void formats_converter::update_target_profiles_data( const stream_profiles & fro
             raw_profile->set_stream_type( from_profile->get_stream_type() );
             auto video_raw_profile = As< video_stream_profile, stream_profile_interface >( raw_profile );
             const auto video_from_profile = As< video_stream_profile, stream_profile_interface >( from_profile );
-            if( video_raw_profile )
+            // Skip both intrinsics and dims forwarding when from_profile is non-video (e.g. inference):
+            // the raw UVC profile keeps its enumerated dims, and no synthetic intrinsics callback is installed.
+            if( video_raw_profile && video_from_profile )
             {
                 video_raw_profile->set_intrinsics( [video_from_profile]()
                 {
-                    if( video_from_profile )
-                        return video_from_profile->get_intrinsics();
-                    else
-                        return rs2_intrinsics{};
+                    return video_from_profile->get_intrinsics();
                 } );
 
                 // Hack for L515 confidence.

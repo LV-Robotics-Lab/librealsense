@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #include "pointcloud.h"
 #include "occlusion-filter.h"
@@ -15,13 +15,17 @@
 #include <librealsense2/rs.hpp>
 
 #include <rsutils/string/from.h>
+#include <rsutils/easylogging/easyloggingpp.h>
 
 #ifdef RS2_USE_CUDA
 #include "proc/cuda/cuda-pointcloud.h"
+#include "rsutils/accelerators/gpu.h"
 #endif
 #ifdef __SSSE3__
 #include "proc/sse/sse-pointcloud.h"
 #endif
+#include "proc/neon/neon-pointcloud.h"
+
 
 namespace librealsense
 {
@@ -394,13 +398,21 @@ namespace librealsense
     std::shared_ptr<pointcloud> pointcloud::create()
     {
         #ifdef RS2_USE_CUDA
+        if (rsutils::rs2_is_cuda_available())
+        {
+            LOG_INFO("Using CUDA-optimized pointcloud implementation");
             return std::make_shared<librealsense::pointcloud_cuda>();
-        #else
-        #ifdef __SSSE3__
-            return std::make_shared<librealsense::pointcloud_sse>();
-        #else
-            return std::make_shared<librealsense::pointcloud>();
+        }
         #endif
+        #ifdef __SSSE3__
+            LOG_INFO("Using SSE-optimized pointcloud implementation");
+            return std::make_shared<librealsense::pointcloud_sse>();
+        #elif defined(__ARM_NEON) && defined(BUILD_WITH_NEON) && !defined(ANDROID)
+            LOG_INFO("Using NEON-optimized pointcloud implementation");
+            return std::make_shared<librealsense::pointcloud_neon>();
+        #else
+            LOG_INFO("Using generic (non-SIMD) pointcloud implementation");
+            return std::make_shared<librealsense::pointcloud>();
         #endif
     }
 

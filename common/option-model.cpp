@@ -1,12 +1,18 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 
 #include "option-model.h"
+#include <realsense_imgui.h>
 #include <librealsense2/rs_advanced_mode.hpp>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include "device-model.h"
 #include "subdevice-model.h"
+#include <os.h>
+
+#include <rsutils/easylogging/easyloggingpp.h>
+
+#include <stdexcept>
 
 namespace rs2
 {
@@ -30,6 +36,7 @@ namespace rs2
         option.supported = opt->is_valid;  // i.e., supported-and-enabled!
         option.range = options->get_option_range( opt->id );
         option.read_only = options->is_option_read_only( opt->id );
+        option.last_slider_hold_stopwatch.reset( {} ); // Avoids seeming as if a slider was dragged and just released.
         return option;
     }
 }
@@ -52,13 +59,18 @@ bool option_model::draw( std::string & error_message,
     auto res = false;
     if( endpoint->supports( opt ) )
     {
+        std::string desc_str( endpoint->get_option_description( opt ) );
+
         // The option's rendering model supports an alternative option title derived from its
         // description rather than name. This is applied to the Holes Filling as its display must
         // conform with the names used by a 3rd-party tools for consistency.
-        if( opt == RS2_OPTION_HOLES_FILL )
+        if (opt == RS2_OPTION_HOLES_FILL)
+        {
             use_option_name = false;
-
-        std::string desc_str( endpoint->get_option_description( opt ) );
+            // Below change is instead of the long description provided with DDS
+            // which is useful when user does not know what are the options' possible values
+            desc_str = "Persistency mode"; 
+        }
 
         // Device D405 is for short range, therefore, its units are in cm - for better UX
         bool use_cm_units = false;
@@ -125,9 +137,36 @@ bool option_model::draw( std::string & error_message,
             ImGui::PopStyleColor();
 
             if( ImGui::IsItemHovered() )
-                ImGui::SetTooltip( "Select custom region of interest for the auto-exposure "
+                RsImGui::CustomTooltip( "Select custom region of interest for the auto-exposure "
                                    "algorithm\nClick the button, then draw a rect on the frame" );
         }
+
+        auto advanced = dev->dev.as< rs400::advanced_mode >();
+        auto supports_auto_hdr = std::string(dev->dev.get_info(RS2_CAMERA_INFO_NAME)).find("D45") != std::string::npos; // auto HDR is only supported on D45*
+        if( opt == RS2_OPTION_HDR_ENABLED && advanced && advanced.is_enabled() && supports_auto_hdr)
+        {
+            ImGui::SameLine( 0, 10 );
+
+            std::string button_label = "HDR Config";
+            std::string caption = rsutils::string::from() << "HDR Config##" << button_label;
+
+            RsImGui::RsImButton(
+                [&]()
+                {
+                    if( ImGui::Button( caption.c_str(), { 85, 0 } ) )
+                    {
+                        try
+                        {
+                            dev->dev_model->open_hdr_config_tool_window();
+                        }
+                        catch( const std::exception & e )
+                        {
+                            error_message = rsutils::string::from() << "Failed to open HDR configuration: " << e.what();
+                        }
+                    }
+                });
+        }
+    
     }
 
     return res;
@@ -161,7 +200,12 @@ void option_model::update_all_fields( std::string & error_message, notifications
 {
     try
     {
+        // After slider was dragged value updated using set_option, don't update value again here
+        if( last_slider_hold_stopwatch.get_elapsed_ms() < 500 )
+            return;
+
         value = endpoint->get_option_value( opt );
+        _has_user_request->store( false );
         supported = value->is_valid;
         if( supported )
         {
@@ -215,12 +259,13 @@ std::vector< const char * > option_model::get_combo_labels( int * p_selected ) c
 
         switch( value->type )
         {
-        case RS2_OPTION_TYPE_FLOAT:
-            if( std::fabs( i - value->as_float ) < 0.001f )
-                selected = counter;
-            break;
         case RS2_OPTION_TYPE_STRING:
             if( 0 == strcmp( label, value->as_string ) )
+                selected = counter;
+            break;
+
+        default:
+            if( std::fabs( i - value_as_float() ) < 0.001f )
                 selected = counter;
             break;
         }
@@ -248,14 +293,14 @@ bool option_model::draw_combobox( notifications_model & model,
     ImGui::Text( "%s", txt.c_str() );
     if( ImGui::IsItemHovered() && description )
     {
-        ImGui::SetTooltip( "%s", description );
+        RsImGui::CustomTooltip( "%s", description );
     }
 
     ImGui::SameLine();
     if( new_line )
         ImGui::SetCursorPosX( combo_position_x );
 
-    ImGui::PushItemWidth( new_line ? -1.f : 100.f );
+    ImGui::PushItemWidth( new_line ? ImGui::GetContentRegionAvail().x - 25 : 100.f );
 
     int selected;
     std::vector< const char * > labels = get_combo_labels( &selected );
@@ -263,14 +308,12 @@ bool option_model::draw_combobox( notifications_model & model,
 
     try
     {
-        if( ImGui::Combo( id.c_str(), &selected, labels.data(), static_cast< int >( labels.size() ) ) )
+        if( RsImGui::CustomComboBox( id.c_str(), &selected, labels.data(), static_cast< int >( labels.size() ) ) )
         {
             float tmp_value = range.min + range.step * selected;
             model.add_log( rsutils::string::from()
                            << "Setting " << opt << " to " << tmp_value << " (" << labels[selected] << ")" );
-            set_option( opt, tmp_value, error_message );
-            if( invalidate_flag )
-                *invalidate_flag = true;
+            write_value( tmp_value, error_message );
             item_clicked = true;
         }
     }
@@ -284,6 +327,68 @@ bool option_model::draw_combobox( notifications_model & model,
     return item_clicked;
 }
 
+
+float option_model::value_as_float() const
+{
+    // While the user-requested value is fresh, prefer it over the stale cached `value`
+    // so the slider doesn't visually snap back between dispatch and FW echo. Cap at 2 s
+    // in case the FW echoes a different value (rejected/clamped) — beyond that we want
+    // the user to see what was actually applied.
+    if( _has_user_request->load() && _user_request_stopwatch.get_elapsed_ms() < 2000 )
+        return _user_request_value;
+
+    switch( value->type )
+    {
+    case RS2_OPTION_TYPE_FLOAT:
+        return value->as_float;
+        break;
+
+    case RS2_OPTION_TYPE_INTEGER:
+    case RS2_OPTION_TYPE_BOOLEAN:
+        return float( value->as_integer );
+        break;
+    case RS2_OPTION_TYPE_STRING:
+        if( range.min == 0.f && range.step == 1.f ) // We can convert enum option to float
+        {
+            for( auto i = 0.f; i <= range.max; i += range.step )
+            {
+                auto desc = endpoint->get_option_value_description( opt, i );
+                if( ! desc )
+                    break;
+                if( strcmp( value->as_string, desc ) == 0 )
+                    return i;
+            }
+        }
+        break;
+    }
+    return 0.f;
+}
+
+
+std::string option_model::value_as_string() const
+{
+    switch( value->type )
+    {
+    case RS2_OPTION_TYPE_FLOAT:
+        if( is_all_integers() )
+            return rsutils::string::from() << (int) value->as_float;
+        else
+            return rsutils::string::from() << value->as_float;
+        break;
+
+    case RS2_OPTION_TYPE_INTEGER:
+    case RS2_OPTION_TYPE_BOOLEAN:
+        return rsutils::string::from() << value->as_integer;
+        break;
+
+    case RS2_OPTION_TYPE_STRING:
+        return value->as_string;
+        break;
+    }
+    return {};
+}
+
+
 bool option_model::draw_slider( notifications_model & model,
                                 std::string & error_message,
                                 const char * description,
@@ -294,7 +399,7 @@ bool option_model::draw_slider( notifications_model & model,
     ImGui::Text( "%s", txt.c_str() );
 
     ImGui::SameLine();
-    ImGui::SetCursorPosX( read_only ? 268.f : 245.f );
+    ImGui::SetCursorPosX( read_only ? 280.f : 257.f );
     ImGui::PushStyleColor( ImGuiCol_Text, grey );
     ImGui::PushStyleColor( ImGuiCol_TextSelectedBg, grey );
     ImGui::PushStyleColor( ImGuiCol_ButtonActive, { 1.f, 1.f, 1.f, 0.f } );
@@ -304,13 +409,13 @@ bool option_model::draw_slider( notifications_model & model,
     ImGui::PopStyleColor( 5 );
     if( ImGui::IsItemHovered() && description )
     {
-        ImGui::SetTooltip( "%s", description );
+        RsImGui::CustomTooltip( "%s", description );
     }
 
     if( ! read_only )
     {
         ImGui::SameLine();
-        ImGui::SetCursorPosX( 268 );
+        ImGui::SetCursorPosX( 280 );
         if( ! edit_mode )
         {
             std::string edit_id = rsutils::string::from() << textual_icons::edit << "##" << id;
@@ -320,15 +425,12 @@ bool option_model::draw_slider( notifications_model & model,
             ImGui::PushStyleColor( ImGuiCol_Button, { 1.f, 1.f, 1.f, 0.f } );
             if( ImGui::Button( edit_id.c_str(), { 20, 20 } ) )
             {
-                if( is_all_integers() )
-                    edit_value = rsutils::string::from() << (int)value->as_float;
-                else
-                    edit_value = rsutils::string::from() << value->as_float;
+                edit_value = value_as_string();
                 edit_mode = true;
             }
             if( ImGui::IsItemHovered() )
             {
-                ImGui::SetTooltip( "Enter text-edit mode" );
+                RsImGui::CustomTooltip( "Enter text-edit mode" );
             }
             ImGui::PopStyleColor( 4 );
         }
@@ -345,31 +447,31 @@ bool option_model::draw_slider( notifications_model & model,
             }
             if( ImGui::IsItemHovered() )
             {
-                ImGui::SetTooltip( "Exit text-edit mode" );
+                RsImGui::CustomTooltip( "Exit text-edit mode" );
             }
             ImGui::PopStyleColor( 4 );
         }
     }
-
-    ImGui::PushItemWidth( -1 );
-
+    float customWidth = 295 - ImGui::GetCursorPosX(); //set slider width from the current Xpos to the right border at 295 (the edit button pos)
+    ImGui::PushItemWidth(customWidth);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, black);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, black);
     try
     {
         if( read_only )
         {
             ImVec2 vec{ 0, 20 };
-            std::string text = ( value->as_float == (int)value->as_float ) ? std::to_string( (int)value->as_float )
-                                                                           : std::to_string( value->as_float );
+            std::string text = value_as_string();
             if( range.min != range.max )
             {
-                ImGui::ProgressBar( ( value->as_float / ( range.max - range.min ) ), vec, text.c_str() );
+                ImGui::ProgressBar( ( value_as_float() / ( range.max - range.min ) ), vec, text.c_str() );
             }
             else  // constant value options
             {
                 auto c = ImGui::ColorConvertU32ToFloat4( ImGui::GetColorU32( ImGuiCol_FrameBg ) );
                 ImGui::PushStyleColor( ImGuiCol_FrameBgActive, c );
                 ImGui::PushStyleColor( ImGuiCol_FrameBgHovered, c );
-                float dummy = std::floor( value->as_float );
+                float dummy = std::floor( value_as_float() );
                 if( ImGui::DragFloat( id.c_str(), &dummy, 1, 0, 0, text.c_str() ) )
                 {
                     // Changing the depth units not on advanced mode is not allowed,
@@ -403,7 +505,7 @@ bool option_model::draw_slider( notifications_model & model,
 
             char buff[TEXT_BUFF_SIZE];
             memset( buff, 0, TEXT_BUFF_SIZE );
-            strcpy( buff, buff_str.c_str() );
+            strncpy( buff, buff_str.c_str(), TEXT_BUFF_SIZE - 1 );
 
             if( ImGui::InputText( id.c_str(),
                                   buff,
@@ -414,7 +516,7 @@ bool option_model::draw_slider( notifications_model & model,
                 {
                     buff_str = convert_float_str( std::string( buff ), 0.01f );
                     memset( buff, 0, TEXT_BUFF_SIZE );
-                    strcpy( buff, buff_str.c_str() );
+                    strncpy( buff, buff_str.c_str(), TEXT_BUFF_SIZE - 1 );
                 }
                 float new_value;
                 if( ! rsutils::string::string_to_value< float >( buff, new_value ) )
@@ -433,13 +535,8 @@ bool option_model::draw_slider( notifications_model & model,
                 else
                 {
                     // run when the value is valid and the enter key is pressed to submit the new value
-                    auto option_was_set = set_option(opt, new_value, error_message);
-                    if (option_was_set)
-                    {
-                        if (invalidate_flag)
-                            *invalidate_flag = true;
-                        model.add_log(rsutils::string::from() << "Setting " << opt << " to " << value->as_float);
-                    }
+                    write_value( new_value, error_message );
+                    model.add_log( rsutils::string::from() << "Setting " << opt << " to " << value_as_string() );
                 }
                 edit_mode = false;
             }
@@ -447,38 +544,33 @@ bool option_model::draw_slider( notifications_model & model,
             {
                 buff_str = convert_float_str( buff_str, 0.01f );
                 memset( buff, 0, TEXT_BUFF_SIZE );
-                strcpy( buff, buff_str.c_str() );
+                strncpy( buff, buff_str.c_str(), TEXT_BUFF_SIZE - 1 );
             }
             edit_value = buff;
         }
         else if( is_all_integers() )
         {
             // runs when changing a value with slider and not the textbox
-            auto int_value = static_cast< int >( value->as_float );
+            auto int_value = static_cast< int >( value_as_float() );
 
-            if( ImGui::SliderIntWithSteps( id.c_str(),
-                                           &int_value,
-                                           static_cast< int >( range.min ),
-                                           static_cast< int >( range.max ),
-                                           static_cast< int >( range.step ) ) )
+            if( RsImGui::SliderIntWithSteps( id.c_str(),
+                                             &int_value,
+                                             static_cast< int >( range.min ),
+                                             static_cast< int >( range.max ),
+                                             static_cast< int >( range.step ) ) )
             {
                 // TODO: Round to step?
-                slider_clicked = slider_selected( opt,
-                                                  static_cast< float >( int_value ),
-                                                  error_message,
-                                                  model );
+                slider_clicked = slider_selected( opt, static_cast< float >( int_value ), error_message, model );
+                last_slider_hold_stopwatch.reset(); // While sliding the control, avoid other means of updating value
             }
             else
             {
-                slider_clicked = slider_unselected( opt,
-                                                    static_cast< float >( int_value ),
-                                                    error_message,
-                                                    model );
+                slider_clicked = slider_unselected( opt, static_cast< float >( int_value ), error_message, model );
             }
         }
         else
         {
-            float tmp_value = value->as_float;
+            float tmp_value = value_as_float();
             float temp_value_displayed = tmp_value;
             float min_range_displayed = range.min;
             float max_range_displayed = range.max;
@@ -539,7 +631,8 @@ bool option_model::draw_slider( notifications_model & model,
     {
         error_message = error_to_string( e );
     }
-
+    ImGui::PopStyleColor(2);
+    ImGui::PopItemWidth();
     return slider_clicked;
 }
 
@@ -554,20 +647,19 @@ bool option_model::draw_checkbox( notifications_model & model,
 {
     bool checkbox_was_clicked = false;
 
-    auto bool_value = value->as_float > 0.0f;
+    bool bool_value = value_as_float() > 0.f;
+
     if( ImGui::Checkbox( label.c_str(), &bool_value ) )
     {
         checkbox_was_clicked = true;
         model.add_log( rsutils::string::from() << "Setting " << opt << " to " << ( bool_value ? "1.0" : "0.0" ) << " ("
                                                << ( bool_value ? "ON" : "OFF" ) << ")" );
 
-        set_option( opt, bool_value ? 1.f : 0.f, error_message );
-        if (invalidate_flag)
-            *invalidate_flag = true;
+        write_value( bool_value ? 1.f : 0.f, error_message );
     }
     if( ImGui::IsItemHovered() && description )
     {
-        ImGui::SetTooltip( "%s", description );
+        RsImGui::CustomTooltip( "%s", description );
     }
     return checkbox_was_clicked;
 }
@@ -575,58 +667,72 @@ bool option_model::draw_checkbox( notifications_model & model,
 bool option_model::slider_selected( rs2_option opt,
                                     float value,
                                     std::string & error_message,
-                                    notifications_model & model )
+                                    notifications_model & /*model*/ )
 {
-    bool res = false;
-    auto option_was_set = set_option( opt, value, error_message, std::chrono::milliseconds( 200 ) );
-    if( option_was_set )
-    {
-        have_unset_value = false;
-        if (invalidate_flag)
-            *invalidate_flag = true;
-        model.add_log( rsutils::string::from() << "Setting " << opt << " to " << value );
-        res = true;
-    }
-    else
-    {
-        have_unset_value = true;
-        unset_value = value;
-    }
-    return res;
+    check_opt( opt, __func__ );
+    // Async (FW) path: dispatch every UI tick — the dispatcher action coalesces (per-option
+    // _latest_pending_value) and its try_sleep enforces the FW-write floor, so per-tick calls
+    // are cheap; invalidate + add_log fire later from draw_option once a write completes.
+    // Sync (software-filter) path: an integer-stepped slider only changes on step crossings, so
+    // this fires a handful of times per drag, each an instant in-process write with readback.
+    write_value( value, error_message );
+    return true;
 }
+
 bool option_model::slider_unselected( rs2_option opt,
-                                      float value,
-                                      std::string & error_message,
-                                      notifications_model & model )
+                                      float /*value*/,
+                                      std::string & /*error_message*/,
+                                      notifications_model & /*model*/ )
 {
-    bool res = false;
-    // Slider unselected, if last value was ignored, set with last value if the value was
-    // changed.
-    if( have_unset_value )
-    {
-        if( value != unset_value )
-        {
-            auto set_ok
-                = set_option( opt, unset_value, error_message, std::chrono::milliseconds( 100 ) );
-            if( set_ok )
-            {
-                model.add_log( rsutils::string::from() << "Setting " << opt << " to " << unset_value );
-                if (invalidate_flag)
-                    *invalidate_flag = true;
-                have_unset_value = false;
-                res = true;
-            }
-        }
-        else
-            have_unset_value = false;
-    }
-    return res;
+    check_opt( opt, __func__ );
+    // No-op. slider_selected dispatches on every tick (cheap, coalesced), so
+    // the user's final position is already in _latest_pending_value and will
+    // be picked up by the dispatcher's next action. No retry-on-release needed.
+    return false;
 }
 
 bool option_model::draw_option(bool update_read_only_options,
     bool is_streaming,
     std::string& error_message, notifications_model& model)
 {
+    // Drain the async worker's cross-thread state on the UI thread:
+    //  - last_error: any FW write failure — surface as an error_message that
+    //    eventually drives viewer_model::popup_if_error (matching the pre-PR
+    //    synchronous flow's error UX; deduplicated by message and honoring the
+    //    user's "don't show this error again" preference).
+    //  - did_write / written_value: a FW write completed since the last drain.
+    //    Fire *invalidate_flag and add_log here so both are tied to the actual
+    //    FW write rather than to UI-thread dispatch — keeps cross-option re-polls
+    //    from reading stale values while a write is still queued.
+    {
+        std::string async_err;
+        bool did_write = false;
+        float written_value = 0.f;
+        {
+            std::lock_guard< std::mutex > lk( _async_state->mutex );
+            async_err.swap( _async_state->last_error );
+            did_write = _async_state->did_write;
+            written_value = _async_state->written_value;
+            _async_state->did_write = false;
+        }
+        if( ! async_err.empty() )
+        {
+            try
+            {
+                error_message = rsutils::string::from()
+                              << "Failed to set " << endpoint->get_option_name( opt )
+                              << ": " << async_err;
+            }
+            catch( ... ) {}
+        }
+        if( did_write )
+        {
+            if( invalidate_flag )
+                *invalidate_flag = true;
+            model.add_log( rsutils::string::from() << "Setting " << opt << " to " << written_value );
+        }
+    }
+
     if (update_read_only_options)
     {
         update_supported(error_message);
@@ -645,34 +751,224 @@ bool option_model::draw_option(bool update_read_only_options,
         return draw(error_message, model);
 }
 
-bool option_model::set_option(rs2_option opt,
-    float req_value,
-    std::string& error_message,
-    std::chrono::steady_clock::duration ignore_period)
+bool option_model::set_option( rs2_option opt,
+                               float req_value,
+                               std::string & error_message,
+                               std::chrono::steady_clock::duration ignore_period )
 {
-    // Only set the value if `ignore_period` time past since last set_option() call for this option
-    if (last_set_stopwatch.get_elapsed() < ignore_period)
+    check_opt( opt, __func__ );
+    // Synchronous FW write. Use set_option_async from the UI thread to avoid
+    // blocking the render loop on the ~200 ms FW round-trip.
+    if( last_set_stopwatch.get_elapsed() < ignore_period )
         return false;
 
     try
     {
         last_set_stopwatch.reset();
-        endpoint->set_option(opt, req_value);
+        endpoint->set_option( opt, req_value );
     }
-    catch (const error& e)
+    catch( const error & e )
     {
-        error_message = error_to_string(e);
+        error_message = error_to_string( e );
     }
 
-    // Only update the cached value once set_option is done! That way, if it doesn't change
-    // anything...
+    // Refresh the cached value once the write is done so the UI reflects whatever
+    // the FW actually accepted (which may clamp or reject the requested value).
     try
     {
-        value = endpoint->get_option_value(opt);
+        value = endpoint->get_option_value( opt );
     }
-    catch (...)
+    catch( ... )
     {
     }
 
     return true;
+}
+
+void option_model::check_opt( rs2_option opt, char const * caller ) const
+{
+    if( opt != this->opt )
+        throw std::runtime_error( rsutils::string::from()
+                                  << caller << " called on option_model bound to "
+                                  << this->opt << " with mismatched opt=" << opt );
+}
+
+void option_model::write_value( float new_value, std::string & error_message )
+{
+    if( write_synchronously )
+    {
+        // Software post-processing filters run in-process (no FW round-trip), so a synchronous
+        // write can't freeze the UI — and unlike the async path set_option reads the value back,
+        // so the control reflects what was applied and never reverts to a stale value.
+        // Match set_option_async: back off subdevice_model::update()'s per-frame FW-option polling
+        // while the user is writing, so a filter-slider drag stays smooth on the no-change frames.
+        if( dev )
+            dev->last_user_set_stopwatch.reset();
+        // Use a local error buffer: error_message is shared across the frame's option draws, so a
+        // prior option's failure would otherwise make this write look failed. Only invalidate when
+        // THIS write succeeds (set_option swallows failures into the string), mirroring the async
+        // did_write drain; surface a real failure by propagating it out.
+        std::string write_error;
+        set_option( opt, new_value, write_error );
+        if( write_error.empty() )
+        {
+            if( invalidate_flag )
+                *invalidate_flag = true;
+        }
+        else
+        {
+            error_message = write_error;
+        }
+    }
+    else
+    {
+        set_option_async( opt, new_value );
+    }
+}
+
+void option_model::set_option_async( rs2_option opt, float value )
+{
+    check_opt( opt, __func__ );
+    // Mask the stale cached `value` with the user's just-requested value until the
+    // FW echo refreshes it, so draw_slider doesn't snap back to the old value next
+    // frame. Write _user_request_value and the stopwatch BEFORE flipping the atomic
+    // so any reader that observes the flag set also sees the matching value.
+    _user_request_value = value;
+    _user_request_stopwatch.reset();
+    _has_user_request->store( true );
+    // Tell the parent subdevice_model to back off its per-frame option polling for a
+    // bit, otherwise the UI thread will issue a sync get_option_value() that serializes
+    // on the per-device USB lock behind the dispatcher's in-flight write (and behind any
+    // concurrent options_watcher poll cycle), reintroducing the visible UI freeze.
+    if( dev )
+        dev->last_user_set_stopwatch.reset();
+
+    // Coalesce on the subdevice dispatcher: store the latest requested value, and
+    // only enqueue a new action if one isn't already queued. The action clears the
+    // pending flag BEFORE re-reading _latest_pending_value, so any post() that
+    // arrives during the in-flight FW call gets to enqueue a fresh action for that
+    // update. Result: between any two FW writes only the latest user value survives;
+    // a 60-Hz slider drag produces ~5 Hz of FW writes (paced by the action's
+    // try_sleep below), never queues stale values, and never blocks the UI thread.
+    _latest_pending_value->store( value );
+    if( _has_pending_job->exchange( true ) )
+        return;  // an action is already queued; it will pick up the latest value
+
+    if( ! dev )
+        return;
+    auto disp = dev->set_dispatcher();
+    if( ! disp )
+        return;
+
+    // Capture shared_ptrs by value (NOT `this`) so the action is UAF-safe if
+    // option_model is destroyed mid-FW-call. ~subdevice_model destroys the
+    // dispatcher first (declared last), which stops/joins the worker before any
+    // option_model is gone — but `endpoint` (sensor) outlives both via shared_ptr,
+    // and the atomics outlive the action via these captured shared_ptrs.
+    auto endpoint_copy    = endpoint;
+    auto opt_copy         = opt;
+    auto state            = _async_state;
+    auto has_user_request = _has_user_request;
+    auto pending          = _has_pending_job;
+    auto latest           = _latest_pending_value;
+
+    disp->invoke(
+        [ endpoint_copy, opt_copy, state, has_user_request, pending, latest ](
+            dispatcher::cancellable_timer c )
+        {
+            // Clear the "queued" flag FIRST so a concurrent post() during the FW
+            // call can enqueue a follow-up action; then read back the latest value.
+            pending->store( false );
+            float v = latest->load();
+            std::string err_msg;
+            try
+            {
+                endpoint_copy->set_option( opt_copy, v );
+            }
+            catch( const rs2::error & e )
+            {
+                LOG_WARNING( "async set_option opt=" << opt_copy << " value=" << v
+                                                     << " failed: " << e.what() );
+                err_msg = e.what();
+            }
+            catch( const std::exception & e )
+            {
+                LOG_WARNING( "async set_option opt=" << opt_copy << " value=" << v
+                                                     << " failed: " << e.what() );
+                err_msg = e.what();
+            }
+            catch( ... )
+            {
+                LOG_WARNING( "async set_option opt=" << opt_copy << " value=" << v
+                                                     << " failed with unknown exception" );
+                err_msg = "unknown error";
+            }
+            if( ! err_msg.empty() )
+            {
+                {
+                    std::lock_guard< std::mutex > lk( state->mutex );
+                    state->last_error = err_msg;
+                }
+                // FW rejected the write: drop the user-request mask immediately so
+                // the slider snaps back to the actual cached value within a frame
+                // rather than waiting for the 2 s timeout.
+                has_user_request->store( false );
+            }
+            else
+            {
+                // Record that a FW write completed so the UI thread can drive
+                // invalidate + add_log off the actual write, not off dispatch.
+                std::lock_guard< std::mutex > lk( state->mutex );
+                state->did_write     = true;
+                state->written_value = v;
+            }
+            // FW-write floor between actions on this subdevice. 200 ms matches the
+            // pre-PR `ignore_period` gate that used to live on the UI thread, so a
+            // 60 Hz slider drag produces ~5 Hz of FW writes — paced enough to keep
+            // the video frame stream from starving during sustained option traffic,
+            // and to give each invalidate + cross-option re-poll a real value to
+            // read back. Returns early if the dispatcher is shutting down.
+            c.try_sleep( std::chrono::milliseconds( 200 ) );
+        } );
+}
+
+void option_model::set_option_sync( float req_value )
+{
+    // Synchronous variant for callers that need to verify the write took effect
+    // (e.g., on_chip_calib_manager). Goes through the same dispatcher as async
+    // writes so it can't race with concurrent UI option writes on the USB bus.
+    // Blocks the calling thread until the action runs.
+    if( ! dev )
+        return;
+    auto disp = dev->set_dispatcher();
+    if( ! disp )
+        return;
+    disp->invoke_and_wait(
+        [ this, req_value ]( dispatcher::cancellable_timer c )
+        {
+            endpoint->set_option( opt, req_value );
+            // Refresh the cached value under the dispatcher so callers that follow up
+            // with value_as_float() see what the FW actually accepted (which may clamp
+            // or reject the requested value). Mirrors the post-write readback that the
+            // synchronous set_option() does.
+            try
+            {
+                this->value = endpoint->get_option_value( opt );
+            }
+            catch( ... )
+            {
+            }
+            c.try_sleep( std::chrono::milliseconds( 50 ) );
+        },
+        []() { return false; } );
+}
+
+void option_model::update_value( const rs2::option_value & updated_value, notifications_model & model )
+{
+    // After slider was dragged, don't update value from outside (usually on_options_changed callback)
+    if( last_slider_hold_stopwatch.get_elapsed_ms() < 1000 )
+        return;
+
+    value = updated_value;
+    _has_user_request->store( false );
 }

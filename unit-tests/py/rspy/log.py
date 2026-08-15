@@ -1,5 +1,5 @@
 # License: Apache 2.0. See LICENSE file in root directory.
-# Copyright(c) 2021 Intel Corporation. All Rights Reserved.
+# Copyright(c) 2021 RealSense, Inc. All Rights Reserved.
 
 import sys, os
 
@@ -160,10 +160,10 @@ def is_debug_on():
 if find_flag( '--debug' ):
     sys.argv.remove( '--debug' )
     debug_on()
-def debug_indent( n = 1, indentation = '    ' ):
+def debug_indent( n = 1, indentation = '  ' ):
     global _debug_indent
     _debug_indent += n * indentation
-def debug_unindent( n = 1, indentation = '    ' ):
+def debug_unindent( n = 1, indentation = '  ' ):
     global _debug_indent
     _debug_indent = _debug_indent[:-n * len(indentation)]
 

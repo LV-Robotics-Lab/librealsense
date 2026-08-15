@@ -1,5 +1,5 @@
 /* License: Apache 2.0. See LICENSE file in root directory.
-   Copyright(c) 2017 Intel Corporation. All Rights Reserved. */
+   Copyright(c) 2017 RealSense, Inc. All Rights Reserved. */
 
 /** \file rs_sensor.h
 * \brief
@@ -35,6 +35,10 @@ typedef enum rs2_camera_info {
     RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID             , /**< Firmware update ID */
     RS2_CAMERA_INFO_IP_ADDRESS                     , /**< IP address for remote camera. */
     RS2_CAMERA_INFO_DFU_DEVICE_PATH                , /**< DFU Device node path */
+    RS2_CAMERA_INFO_CONNECTION_TYPE                , /**< Connection type, for example USB, GMSL, DDS */
+    RS2_CAMERA_INFO_SMCU_FW_VERSION                , /**< Safety MCU FW Version */
+    RS2_CAMERA_INFO_IMU_TYPE                       , /**< IMU Type */
+    RS2_CAMERA_INFO_MIPI_DRIVER_VERSION            , /**< MIPI driver version (Jetson platform only) */
     RS2_CAMERA_INFO_COUNT                            /**< Number of enumeration values. Not a valid input: intended to be used in for-loops. */
 } rs2_camera_info;
 const char* rs2_camera_info_to_string(rs2_camera_info info);
@@ -53,6 +57,10 @@ typedef enum rs2_stream
     RS2_STREAM_POSE                             , /**< 6 Degrees of Freedom pose data, calculated by RealSense device */
     RS2_STREAM_CONFIDENCE                       , /**< 4 bit per-pixel depth confidence level */
     RS2_STREAM_MOTION                           , /**< Native stream of combined motion data (incl. accel & gyro) */
+    RS2_STREAM_SAFETY                           , /**< safety info */
+    RS2_STREAM_OCCUPANCY                        , /**< occupancy info */
+    RS2_STREAM_LABELED_POINT_CLOUD              , /**< labeled point cloud stream */
+    RS2_STREAM_OBJECT_DETECTION                 , /**< object detection stream */
     RS2_STREAM_COUNT
 } rs2_stream;
 const char* rs2_stream_to_string(rs2_stream stream);
@@ -92,8 +100,9 @@ typedef enum rs2_format
     RS2_FORMAT_FG              , /**< 16-bit per-pixel frame grabber format. */
     RS2_FORMAT_Y411            , /**< 12-bit per-pixel. */
     RS2_FORMAT_Y16I            , /**< 12-bit per pixel interleaved. 12-bit left, 12-bit right. */
-    RS2_FORMAT_M420            , /**< 24-bit for every pixel: y for each pixel, and u,v data for every four pixels - packed as 2 lines of y, 1 line of u,v */
+    RS2_FORMAT_M420            , /**< YUV 4:2:0: y for each pixel, and u,v data for every four pixels - packed as 2 lines of y, 1 line of u,v. 12 bits per pixel on average. */
     RS2_FORMAT_COMBINED_MOTION , /**< Combined motion data, as in the combined_motion structure */
+    RS2_FORMAT_NV12            , /**< Semi-planar YUV 4:2:0: full-resolution Y plane followed by interleaved half-resolution U,V plane. 12 bits per pixel. */
     RS2_FORMAT_COUNT             /**< Number of enumeration values. Not a valid input: intended to be used in for-loops. */
 } rs2_format;
 const char* rs2_format_to_string(rs2_format format);
@@ -346,6 +355,20 @@ rs2_stream_profile_list* rs2_get_stream_profiles(rs2_sensor* sensor, rs2_error**
 * \return            list of debug stream profiles that given subdevice can provide, should be released by rs2_delete_profiles_list
 */
 rs2_stream_profile_list * rs2_get_debug_stream_profiles( rs2_sensor * sensor, rs2_error ** error );
+
+/**
+* create a static snapshot of all embedded filters within a specific sensor.
+* \param[in]  sensor    specific RealSense sensor
+* \param[out] error     if non-null, receives any error that occurs during this call, otherwise, errors are ignored
+* \return               the list of embedded filters, should be released by rs2_delete_embeddded_filter_list
+*/
+rs2_embedded_filter_list* rs2_query_embedded_filters(const rs2_sensor* sensor, rs2_error** error);
+
+/**
+* delete embedded filter list allocated by rs2_query_embedded_filters
+* \param[in] embedded_filter_list       embedded filter list to delete
+*/
+void rs2_delete_embedded_filter_list(rs2_embedded_filter_list* embedded_filter_list);
 
 /**
 * check how subdevice is streaming

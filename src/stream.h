@@ -1,22 +1,17 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015-24 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include "core/stream-interface.h"
 #include "core/stream-profile-interface.h"
 #include "core/video.h"
 #include "core/motion.h"
+#include "core/inference.h"
 #include "core/stream-profile.h"
 #include "core/tagged-profile.h"
-#include "context.h"
-#include "image.h"
+#include "librealsense-exception.h"
 #include "environment.h"
 
-
-namespace librealsense
-{
-    class stream_profile_interface;
-}
 
 struct rs2_stream_profile
 {
@@ -58,6 +53,8 @@ namespace librealsense
             throw not_implemented_exception( "not a backend profile!" );
         }
 
+        virtual void to_stream( std::ostream & ) const {}
+
         virtual ~backend_stream_profile() = default;
     };
 
@@ -87,6 +84,9 @@ namespace librealsense
             _uid = uid;
         };
 
+        const char * get_name() override { return _name.c_str(); }
+        void set_name( const std::string & name ) override { _name = name; }
+
         rs2_stream_profile* get_c_wrapper() const override;
 
         void set_c_wrapper(rs2_stream_profile* wrapper) override;
@@ -103,6 +103,7 @@ namespace librealsense
         int _tag = profile_tag::PROFILE_TAG_ANY;
         rs2_stream_profile _c_wrapper;
         rs2_stream_profile* _c_ptr = nullptr;
+        std::string _name;
     };
 
     class video_stream_profile : public virtual video_stream_profile_interface, public stream_profile_base, public extension_snapshot
@@ -136,7 +137,7 @@ namespace librealsense
             auto id = environment::get_instance().generate_stream_id();
 
             res->set_unique_id( id );
-            LOG_DEBUG( "video_stream_profile::clone, id= " << id );
+            //LOG_DEBUG( "video_stream_profile::clone, id= " << id );
             res->set_dims(get_width(), get_height());
             std::function<rs2_intrinsics()> int_func = _calc_intrinsics;
             res->set_intrinsics([int_func]() { return int_func(); });
@@ -217,6 +218,24 @@ namespace librealsense
             return res;
         }
 
+    };
+
+    class inference_stream_profile : public inference_stream_profile_interface, public stream_profile_base, public extension_snapshot
+    {
+    public:
+        explicit inference_stream_profile()
+        {
+        }
+
+        void update( std::shared_ptr< extension_snapshot > ext ) override { /*Nothing to do here*/ }
+
+        std::shared_ptr< stream_profile_interface > clone() const override
+        {
+            auto res = std::make_shared< inference_stream_profile >();
+            res->set_unique_id( environment::get_instance().generate_stream_id() );
+            res->set_framerate( get_framerate() );
+            return res;
+        }
     };
 
     inline stream_profile to_profile(const stream_profile_interface* sp)

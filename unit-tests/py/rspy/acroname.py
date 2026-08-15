@@ -1,5 +1,5 @@
 # License: Apache 2.0. See LICENSE file in root directory.
-# Copyright(c) 2021 Intel Corporation. All Rights Reserved.
+# Copyright(c) 2021 RealSense, Inc. All Rights Reserved.
 
 """
 Brainstem Acroname Hub
@@ -8,9 +8,15 @@ See documentation for brainstem here:
 https://acroname.com/reference/api/python/index.html
 """
 
-from rspy import log, device_hub
+from rspy import log, device_hub, signals
 import time
 import platform, re
+
+# Minimum elapsed time (seconds) required between issuing a port disable and a
+# subsequent port enable on the Acroname USBHub3p (firmware 2.12.2). Below this
+# threshold, sustained disable/enable traffic on high-current ports (observed
+# with D585S, ~1 A idle) can leave the BrainStem control endpoint unresponsive.
+_MIN_PORT_RECYCLE_GAP_S = 2.0
 
 if __name__ == '__main__':
     import os, sys, getopt
@@ -37,8 +43,9 @@ if __name__ == '__main__':
 
 try:
     import brainstem
+    log.d( f'brainstem {brainstem.version.get_version_string().split()[-1]} loaded from {brainstem.__file__}' )
 except ModuleNotFoundError:
-    log.d( 'no acroname library is available' )
+    log.d( 'no brainstem library is available' )
     raise
 
 class NoneFoundError( RuntimeError ):
@@ -55,6 +62,16 @@ class Acroname(device_hub.device_hub):
             raise NoneFoundError()
         self.hub = None
         self.all_hubs = None
+        # Tracks the time we last issued a port-disable command, so that a
+        # subsequent enable can wait out the minimum recycle gap (see
+        # _MIN_PORT_RECYCLE_GAP_S). None means no disable issued yet.
+        self._last_disable_t = None
+
+    def get_name(self):
+        """
+        :return: name of the hub
+        """
+        return 'Acroname'
 
     def connect(self,  reset = False, req_spec = None ):
         """
@@ -133,8 +150,7 @@ class Acroname(device_hub.device_hub):
         :param port: port number;
         :return: True if Acroname enabled this port, False otherwise
         """
-
-        return self.port_state( port ) != "Disabled"
+        return ("Disabled" not in self.port_state( port ))
 
 
     def port_state(self,  port ):
@@ -142,11 +158,11 @@ class Acroname(device_hub.device_hub):
             raise ValueError( "port number must be [0-7]" )
         #
         status = self.hub.usb.getPortState( port )
-        #log.d("getPortState for port", port ,"return", port_state_bitmask_to_string( status.value ))
-        return self.port_state_bitmask_to_string( status.value )
+        #log.d("getPortState for port", port ,"return", port_state_bitmask_to_strings( status.value ))
+        return self.port_state_bitmask_to_strings( status.value )
 
 
-    def port_state_bitmask_to_string(self,  bitmask ):
+    def port_state_bitmask_to_strings(self,  bitmask ):
         """
         https://acroname.com/reference/devices/usbhub3p/entities/usb.html#usb-port-state
         Bit   |  Port State: Result Bitwise Description
@@ -165,14 +181,27 @@ class Acroname(device_hub.device_hub):
         23    |  Device Attached
         24:31 |  Reserved
         """
+        if bitmask < 0 or bitmask > 0xFFFFFFFF: # 32 bits bitmask
+            raise ValueError("bitmask must be within 0 and 0xFFFFFFFF (inclusive)")
+        def bit_on(x):
+            return bitmask & (1 << x)
+        res = ["Enabled" if bit_on(0) else "Disabled"]
+        if bit_on(1):
+            res.append("USB2 Data Enabled")
+        if bit_on(3):
+            res.append("USB3 Data Enabled")
+        if bit_on(11):
+            res.append("USB2 Device Attached")
+        if bit_on(12):
+            res.append("USB3 Device Attached")
+        if bit_on(19):
+            res.append("USB Error Flag")
+        if bit_on(20):
+            res.append("USB2 Boost Enabled")
+        if bit_on(23):
+            res.append("Device Attached")
+        return res
 
-        if bitmask == 0: # Port is disabled by Acroname
-            return "Disabled"
-        if bitmask == 11: # Port is enabled but no device was detected
-            return "Disconnected"
-        if bitmask > 100: # Normally we hope it will cover "Device Attached" use cases (Note, can also be turn on when 'USB Error Flag' is on...but we havn't seen that )
-            return "OK"
-        return "Unknown Error ({})".format( bitmask )
 
 
     def enable_ports(self,  ports = None, disable_other_ports = False, sleep_on_change = 0 ):
@@ -183,31 +212,38 @@ class Acroname(device_hub.device_hub):
         :param sleep_on_change: Number of seconds to sleep if any change is made
         :return: True if no errors found, False otherwise
         """
+        # Wait out the minimum disable->enable gap if a disable was issued recently.
+        # See _MIN_PORT_RECYCLE_GAP_S for rationale.
+        if self._last_disable_t is not None:
+            settle = _MIN_PORT_RECYCLE_GAP_S - (time.monotonic() - self._last_disable_t)
+            if settle > 0:
+                log.d(f"waiting {settle:.2f}s for Acroname port-recycle gap")
+                time.sleep(settle)
         result = True
         changed = False
+        log.d(f"Enabling ports {ports if ports is not None else 'all'} on Acroname"
+              f"{', disabling other ports' if disable_other_ports else ''}")
         for port in self.all_ports():
             #
             if ports is None or port in ports:
-                if not self.is_port_enabled( port ):
-                    #log.d( "enabling port", port)
-                    action_result = self.hub.usb.setPortEnable( port )
-                    if action_result != brainstem.result.Result.NO_ERROR:
-                        result = False
-                        log.e("Failed to enable port", port)
-                    else:
-                        changed = True
+                # log.d( "enabling port", port)
+                action_result = self.hub.usb.setPortEnable( port )
+                if action_result != brainstem.result.Result.NO_ERROR:
+                    result = False
+                    log.e("Failed to enable port", port)
+                else:
+                    changed = True
             #
             elif disable_other_ports:
-                if self.is_port_enabled( port ):
-                    #log.d("disabling port", port)
-                    action_result = self.hub.usb.setPortDisable( port )
-                    if action_result != brainstem.result.Result.NO_ERROR:
-                        result = False
-                    else:
-                        changed = True
+                # log.d("disabling port", port)
+                action_result = self.hub.usb.setPortDisable( port )
+                if action_result != brainstem.result.Result.NO_ERROR:
+                    result = False
+                else:
+                    changed = True
         #
         if changed and sleep_on_change:
-            import time
+            signals.register_signal_handlers()
             time.sleep( sleep_on_change )
         #
         return result
@@ -221,18 +257,21 @@ class Acroname(device_hub.device_hub):
         """
         result = True
         changed = False
+        log.d(f"Disabling ports {ports if ports is not None else 'all'} on Acroname")
         for port in self.all_ports():
             if ports is None or port in ports:
-                if self.is_port_enabled( port ):
-                        #log.d("disabling port", port)
-                        action_result = self.hub.usb.setPortDisable( port )
-                        if action_result != brainstem.result.Result.NO_ERROR:
-                            result = False
-                            log.e("Failed to disable port", port)
-                        else:
-                            changed = True
+                # log.d("disabling port", port)
+                action_result = self.hub.usb.setPortDisable( port )
+                if action_result != brainstem.result.Result.NO_ERROR:
+                    result = False
+                    log.e("Failed to disable port", port)
+                else:
+                    changed = True
+        if changed:
+            # Mark the time so a subsequent enable can wait out the minimum gap.
+            self._last_disable_t = time.monotonic()
         if changed and sleep_on_change:
-            import time
+            signals.register_signal_handlers()
             time.sleep( sleep_on_change )
         #
         return result

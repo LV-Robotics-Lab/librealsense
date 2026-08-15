@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -23,6 +23,7 @@
 
 namespace librealsense
 {
+    class context;
     typedef float float_4[4];
 
     template<typename T>
@@ -60,6 +61,8 @@ namespace librealsense
         const uint8_t DS5_THERMAL_COMPENSATION              = 0xF;
         const uint8_t DS5_EMITTER_FREQUENCY                 = 0x10;
         const uint8_t DS5_DEPTH_AUTO_EXPOSURE_MODE          = 0x11;
+        const uint8_t DS5_EXTERNAL_SYNC                     = 0x12;
+
         // DS5 fisheye XU identifiers
         const uint8_t FISHEYE_EXPOSURE                      = 1;
 
@@ -89,7 +92,7 @@ namespace librealsense
             FEF = 0x0c,     // Erase flash full <Parameter1 Name="0xACE">
             FSRU = 0x0d,     // Flash status register unlock
             FPLOCK = 0x0e,     // Permanent lock on lower Quarter region of the flash
-            GLD = 0x0f,     // FW logs
+            GLD = 0x0f,     // Legacy get FW logs command
             GVD = 0x10,     // camera details
             GETINTCAL = 0x15,     // Read calibration table
             SETINTCAL = 0x16,     // Set Internal sub calibration table
@@ -123,15 +126,20 @@ namespace librealsense
             RECPARAMSGET = 0x7E,     // Retrieve depth calibration table in new format (fw >= 5.11.12.100)
             LASERONCONST = 0x7F,     // Enable Laser On constantly (GS SKU Only)
             AUTO_CALIB = 0x80,      // auto calibration commands
+            HKR_THERMAL_COMPENSATION = 0x84, // Control HKR thermal compensation
             GETAELIMITS = 0x89,   //Auto Exp/Gain Limit command FW version >= 5.13.0.200
             SETAELIMITS = 0x8A,   //Auto Exp/Gain Limit command FW version >= 5.13.0.200
-
-
+            SAFETY_PRESET_READ = 0x94,  // Read safety preset from given index
+            SAFETY_PRESET_WRITE = 0x95,   // Write safety preset to given index
             APM_STROBE_SET = 0x96,        // Control if Laser on constantly or pulse
             APM_STROBE_GET = 0x99,        // Query if Laser on constantly or pulse
             SET_HKR_CONFIG_TABLE = 0xA6, // HKR Set Internal sub calibration table
             GET_HKR_CONFIG_TABLE = 0xA7, // HKR Get Internal sub calibration table
-            CALIBRESTOREEPROM = 0xA8 // HKR Store EEPROM Calibration
+            CALIBRESTOREEPROM = 0xA8, // HKR Store EEPROM Calibration
+            RGB_TNR = 0xAA,      // RGB Temporal Noise Reduction
+            GET_FW_LOGS = 0xB4, // Get FW logs extended format
+            SET_CALIB_MODE = 0xB8,      // Set Calibration Mode
+            GET_CALIB_STATUS = 0xB9      // Get Calibration Status
         };
 
 #define TOSTRING(arg) #arg
@@ -163,6 +171,7 @@ namespace librealsense
                 ENUM2STR(SETSUBPRESET);
                 ENUM2STR(GETSUBPRESET);
                 ENUM2STR(GETSUBPRESETID);
+                ENUM2STR(GET_FW_LOGS);
             default:
               return ( rsutils::string::from() << "Unrecognized FW command " << state );
             }
@@ -202,6 +211,8 @@ namespace librealsense
             CAP_INTERCAM_HW_SYNC = (1u << 8),
             CAP_IP65 = (1u << 9),
             CAP_IR_FILTER = (1u << 10),
+            CAP_BMI_088 = (1u << 11),
+            CAP_EXTERNAL_SYNC_XU = ( 1u << 12 ),  // Support external synchronization via XU
             CAP_MAX
         };
 
@@ -216,7 +227,8 @@ namespace librealsense
             { ds_caps::CAP_BMI_055,          "IMU BMI_055"       },
             { ds_caps::CAP_BMI_085,          "IMU BMI_085"       },
             { ds_caps::CAP_IP65,             "IP65 Sealed device"},
-            { ds_caps::CAP_IR_FILTER,        "IR filter"         }
+            { ds_caps::CAP_IR_FILTER,        "IR filter"         },
+            { ds_caps::CAP_BMI_088,          "IMU BMI_088"       }
         };
 
         inline ds_caps operator &(const ds_caps lhs, const ds_caps rhs)
@@ -263,8 +275,11 @@ namespace librealsense
             uint32_t                table_size;     // full size including: TOC header + TOC + actual tables
             uint32_t                param;          // This field content is defined ny table type
             uint32_t                crc32;          // crc of all the actual table data excluding header/CRC
+
+            std::string to_string() const;
         };
 
+        // Note ds_rect_resolutions is used in struct d400_coefficients_table. Update with caution.
         enum ds_rect_resolutions : unsigned short
         {
             res_1920_1080,
@@ -311,6 +326,16 @@ namespace librealsense
                                                << "Calibration data invalid, buffer too small : expected "
                                                << sizeof( table_header ) << " , actual: " << raw_data.size() );
             }
+
+            // Make sure the table size does not exceed the actual data we have!
+            if( header->table_size + sizeof( table_header ) > raw_data.size() )
+            {
+                throw invalid_value_exception( rsutils::string::from()
+                                               << "Calibration table size does not fit inside reply: expected "
+                                               << ( raw_data.size() - sizeof( table_header ) ) << " but got "
+                                               << header->table_size );
+            }
+
             // verify the parsed table
             if (table->header.crc32 != rsutils::number::calc_crc32(raw_data.data() + sizeof(table_header), raw_data.size() - sizeof(table_header)))
             {
@@ -511,29 +536,10 @@ namespace librealsense
         }
 
 #pragma pack(pop)
-
-        enum gvd_fields
-        {
-            // Keep sorted
-            gvd_version_offset = 2,
-            camera_fw_version_offset = 12,
-            is_camera_locked_offset = 25,
-            module_serial_offset = 48,
-            module_asic_serial_offset = 64,
-            fisheye_sensor_lb = 112,
-            fisheye_sensor_hb = 113,
-            imu_acc_chip_id = 124,
-            ip65_sealed_offset = 161,
-            ir_filter_offset = 164,
-            depth_sensor_type = 166,
-            active_projector = 170,
-            rgb_sensor = 174,
-            imu_sensor = 178,
-            motion_module_fw_version_offset = 212
-        };
-
+        
         const uint8_t I2C_IMU_BMI055_ID_ACC = 0xfa;
         const uint8_t I2C_IMU_BMI085_ID_ACC = 0x1f;
+        const uint8_t I2C_IMU_BMI088_ID_ACC = 0x1e;
 
         enum gvd_fields_size
         {
@@ -554,7 +560,6 @@ namespace librealsense
             { res_1280_720,{ 1280, 720 } },
             { res_1280_800,{ 1280, 800 } },
             { res_1920_1080,{ 1920, 1080 } },
-            //Resolutions for DS5U
             { res_576_576,{ 576, 576 } },
             { res_720_720,{ 720, 720 } },
             { res_1152_1152,{ 1152, 1152 } },
@@ -575,5 +580,8 @@ namespace librealsense
         const std::vector<uint8_t> alternating_emitter_pattern{ 0x5, ALTERNATING_EMITTER_SUBPRESET_ID, 0, 0, 0x2,
             0x4, 0x1, 0, 0x1, 0, 0, 0, 0, 0,
             0x4, 0x1, 0, 0x1, 0, 0x1, 0, 0, 0 };
+
+        bool is_partial_device_allowed( const std::shared_ptr< context > & ctx );
+
     } // librealsense::ds
 } // namespace librealsense

@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include "uvc-device.h"
 #include "uvc-parser.h"
@@ -177,7 +177,7 @@ namespace librealsense
                     switch(state)
                     {
                         case D0:
-                            _messenger = _usb_device->open(_info.mi);
+                            _messenger = _usb_device->open(static_cast<uint8_t>(_info.mi));
                             if (_messenger)
                             {
                                 try{
@@ -323,6 +323,9 @@ namespace librealsense
                 sp.height = f.height;
                 sp.fps = f.fps;
                 sp.format = f.fourcc;
+                // Preserve the VS interface (pin) so identical {w,h,fps,format} profiles coming from different
+                // streaming interfaces (e.g. the two M420 RGB endpoints) stay distinct and route to the right pin.
+                sp.pin_index = f.interfaceNumber;
                 results.push_back(sp);
             }
 
@@ -424,8 +427,8 @@ namespace librealsense
 
         void rs_uvc_device::play_profile(stream_profile profile, frame_callback callback) {
             bool foundFormat = false;
-
             uvc_format_t selected_format{};
+            uint8_t interface_number;
             // Return list of all available formats inside devices[0]
             auto formats = get_available_formats_all();
 
@@ -434,9 +437,11 @@ namespace librealsense
                 if ((profile.format == f.fourcc) &&
                     (profile.fps == f.fps) &&
                     (profile.height == f.height) &&
-                    (profile.width == f.width)) {
+                    (profile.width == f.width) &&
+                    (profile.pin_index == f.interfaceNumber)) {
                         foundFormat = true;
                         selected_format = f;
+                        interface_number = f.interfaceNumber;
                         break;
                 }
             }
@@ -444,6 +449,12 @@ namespace librealsense
             if (foundFormat == false) {
                 throw std::runtime_error("Failed to find supported format!");
             }
+
+            auto inf = _usb_device->get_interface(interface_number);
+            if (inf == nullptr)
+                throw std::runtime_error("can't find UVC streaming interface of device: " + _usb_device->get_info().id);
+            auto _read_endpoint = inf->first_endpoint(platform::RS2_USB_ENDPOINT_DIRECTION_READ);
+            _messenger->reset_endpoint(_read_endpoint, 5000);
 
             auto ctrl = std::make_shared<uvc_stream_ctrl_t>();
             auto ret = get_stream_ctrl_format_size(selected_format, ctrl);
@@ -654,7 +665,7 @@ namespace librealsense
 
         void rs_uvc_device::listen_to_interrupts()
         {
-            auto ctrl_interface = _usb_device->get_interface(_info.mi);
+            auto ctrl_interface = _usb_device->get_interface(static_cast<uint8_t>(_info.mi));
             if (!ctrl_interface)
                 return;
             auto iep = ctrl_interface->first_endpoint(RS2_USB_ENDPOINT_DIRECTION_READ, RS2_USB_ENDPOINT_INTERRUPT);
@@ -856,7 +867,7 @@ namespace librealsense
                                 req,
                                 probe ? (UVC_VS_PROBE_CONTROL << 8) : (UVC_VS_COMMIT_CONTROL << 8),
                                 ctrl->bInterfaceNumber, // When requestType is directed to an interface, the driver automatically passes the interface number in the low byte of index
-                                buf, len, transferred, 0);
+                                buf, static_cast<uint32_t>(len), transferred, 0);
                     } while (sts != RS2_USB_STATUS_SUCCESS && retries++ < 5);
                 }
             }, [this](){ return !_messenger; });

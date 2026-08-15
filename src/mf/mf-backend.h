@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -25,6 +25,9 @@ namespace librealsense
 
             std::shared_ptr<hid_device> create_hid_device(hid_device_info info) const override;
             std::vector<hid_device_info> query_hid_devices() const override;
+
+            std::vector<mipi_device_info> query_mipi_devices() const override;
+
             std::shared_ptr<device_watcher> create_device_watcher() const override;
             std::string get_device_serial(uint16_t device_vid, uint16_t device_pid, const std::string& device_uid) const override;
 

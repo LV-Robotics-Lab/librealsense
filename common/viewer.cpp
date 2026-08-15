@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #ifdef _MSC_VER
 #ifndef NOMINMAX
@@ -15,15 +15,23 @@
 #include <opengl3.h>
 
 #include <imgui_internal.h>
+#include <realsense_imgui.h>
 
 #define ARCBALL_CAMERA_IMPLEMENTATION
 #include <third-party/arcball_camera.h>
 
+#include <rsutils/accelerators/gpu.h>
 #include <rsutils/os/special-folder.h>
 #include <rsutils/string/trim-newlines.h>
+#include <rsutils/string/split.h>
 #include <common/utilities/imgui/wrap.h>
+#include <common/labeled-point-cloud-utilities.h>
+#include <common/utilities/com/center-of-mass.h>
 
+#include <rsutils/easylogging/easyloggingpp.h>
 #include <regex>
+#include <algorithm>
+#include <fstream>
 
 namespace rs2
 {
@@ -70,7 +78,7 @@ namespace rs2
         auto flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
 
-        ImGui_ScopePushFont(font);
+        RsImGui_ScopePushFont(font);
         ImGui::PushStyleColor(ImGuiCol_PopupBg, sensor_bg);
         ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, white);
         ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
@@ -136,7 +144,7 @@ namespace rs2
                 {
                     if (ImGui::IsItemHovered())
                     {
-                        ImGui::SetTooltip("Enable meshing to allow vertex normals calculation");
+                        RsImGui::CustomTooltip("Enable meshing to allow vertex normals calculation");
                     }
                     ImGui::PopStyleColor(2);
                     ImGui::PopStyleVar();
@@ -176,8 +184,7 @@ namespace rs2
             ImGui::PopStyleColor(2); // button color
 
             auto apply = [&]() {
-                config_file::instance() = temp_cfg;
-                update_configuration();
+                update_configuration(&temp_cfg);
             };
 
             ImGui::PushStyleColor(ImGuiCol_Button, button_color);
@@ -226,7 +233,7 @@ namespace rs2
             }
             if (ImGui::IsItemHovered())
             {
-                ImGui::SetTooltip("%s", "Save settings and export file");
+                RsImGui::CustomTooltip("%s", "Save settings and export file");
             }
             ImGui::SameLine();
             if( ImGui::Button( "Cancel", ImVec2( font_size * 8.f, 0 ) ) )
@@ -235,7 +242,7 @@ namespace rs2
             }
             if (ImGui::IsItemHovered())
             {
-                ImGui::SetTooltip("%s", "Close window without saving any changes to the settings");
+                RsImGui::CustomTooltip("%s", "Close window without saving any changes to the settings");
             }
 
             ImGui::PopStyleColor(3);
@@ -295,7 +302,7 @@ namespace rs2
         ImGui::PushFont(font);
         if (dropdown)
         {
-            clicked = clicked || ImGui::Button(u8"\uf078", { font_size, 55 } );
+            clicked = clicked || ImGui::Button(textual_icons::chevron_down, { font_size, 55 } );
             hovered = hovered || ImGui::IsItemHovered();
         }
 
@@ -307,7 +314,7 @@ namespace rs2
         if (hovered)
         {
             win.link_hovered();
-            ImGui::SetTooltip("%s", description);
+            RsImGui::CustomTooltip("%s", description);
         }
 
         if (clicked && !disabled)
@@ -338,6 +345,9 @@ namespace rs2
                 break;
             }
         }
+
+        // Initialize selected_labeled_points_source_uid for clearing it when needed
+        init_labeled_points_uid();
 
         // Initialize and prepare depth and texture sources
         int selected_depth_source = -1;
@@ -457,7 +467,7 @@ namespace rs2
         bool default_view = (pos - float3{ 0.f, 0.f, -1.f }).length() < 0.001f &&
                             (target - float3{ 0.f, 0.f, 0.f }).length() < 0.001f;
         bool active = false;
-        if (big_button(&active, win, 5 + left, 0, u8"\uf01e", "Reset", false, !default_view, "Reset 3D viewport to initial state"))
+        if (big_button(&active, win, 5 + left, 0, textual_icons::rotate, "Reset", false, !default_view, "Reset 3D viewport to initial state"))
         {
             reset_camera();
         }
@@ -492,8 +502,7 @@ namespace rs2
         // ------------ Depth Selection --------------
 
         const auto source_selection_popup = "Source Selection";
-
-        if (big_button(&select_3d_source, win, left, 0, u8"\uf1b2",
+        if (big_button(&select_3d_source, win, left, 0, textual_icons::cube,
                        "Source", true,
                        has_stream,
                        "List of available 3D data sources"))
@@ -548,7 +557,7 @@ namespace rs2
         ImVec4 text_color = light_grey * (1.f - t) + light_blue * t;
 
         const auto tex_selection_popup = "Tex Selection";
-        if (big_button(&select_tex_source, win, left, 0, u8"\uf576",
+        if (big_button(&select_tex_source, win, left, 0, textual_icons::palette,
                        "Texture", true,
                        has_stream,
                        "List of available texture sources", text_color))
@@ -586,7 +595,7 @@ namespace rs2
 
         // ------------ Shader Selection --------------
         const auto shader_selection_popup = "Shading Selection";
-        if (big_button(&select_shader_source, win, left, 0, u8"\uf5aa",
+        if (big_button(&select_shader_source, win, left, 0, textual_icons::adjust,
                        "Shading", true, true,
                        "List of available shading modes"))
         {
@@ -638,7 +647,7 @@ namespace rs2
         if (_measurements.is_enabled())
         {
             bool active = true;
-            if (big_button(&active, win, 5 + left, 0, textual_icons::measure, "Measure", false, glsl_available, measure_tooltip.c_str()))
+            if (big_button(&active, win, 5 + left, 0, textual_icons::ruler, "Measure", false, glsl_available, measure_tooltip.c_str()))
             {
                 _measurements.disable();
             }
@@ -646,7 +655,7 @@ namespace rs2
         else
         {
             bool active = false;
-            if (big_button(&active, win, 5 + left, 0, textual_icons::measure, "Measure", false, glsl_available, measure_tooltip.c_str()))
+            if (big_button(&active, win, 5 + left, 0, textual_icons::ruler, "Measure", false, glsl_available, measure_tooltip.c_str()))
             {
                 _measurements.enable();
             }
@@ -659,7 +668,7 @@ namespace rs2
         set_export_popup(large_font, font, stream_rect, error_message, temp_cfg);
 
         active = false;
-        if (big_button(&active, win, 5 + left, 0, textual_icons::floppy, "Export", false, last_points, "Export 3D model to 3rd-party application"))
+        if (big_button(&active, win, 5 + left, 0, textual_icons::save, "Export", false, last_points, "Export 3D model to 3rd-party application"))
         {
             _measurements.disable();
             temp_cfg = config_file::instance();
@@ -667,6 +676,79 @@ namespace rs2
         }
 
         left += button_width;
+
+        //-----------------------------
+        // -------------------- LPC Settings ----------------
+        if (last_labeled_points)
+        {
+            ImGui::GetWindowDrawList()->AddLine({ cursor.x + left - 1, cursor.y + 5 },
+                { cursor.x + left - 1, cursor.y + top_bar_height - 5 }, ImColor(grey));
+
+            left += 10;
+
+            // -------------------- LPC Points Size ----------------
+            const auto lpc_popup = "LPC Draw";
+            if (big_button(&select_lpc_point_size, win, left, 0, textual_icons::grid_6,
+                "Point Size", true, true,
+                "Labeled Point Cloud"))
+            {
+                ImGui::OpenPopup(lpc_popup);
+            }
+
+            ImGui::SetNextWindowPos({ cursor.x + left + 5, cursor.y + 60 });
+            if (ImGui::BeginPopup(lpc_popup))
+            {
+                select_lpc_point_size = true;
+
+                bool selected = selected_lpc_points_size == lpc_points_size::lpc_small;
+                if (ImGui::MenuItem("Small", nullptr, &selected))
+                {
+                    if (selected) selected_lpc_points_size = lpc_points_size::lpc_small;
+                }
+
+                selected = selected_lpc_points_size == lpc_points_size::lpc_medium;
+                if (ImGui::MenuItem("Medium", nullptr, &selected))
+                {
+                    if (selected) selected_lpc_points_size = lpc_points_size::lpc_medium;
+                }
+
+                selected = selected_lpc_points_size == lpc_points_size::lpc_large;
+                if (ImGui::MenuItem("Large", nullptr, &selected))
+                {
+                    if (selected) selected_lpc_points_size = lpc_points_size::lpc_large;
+                }
+                config_file::instance().set(configurations::viewer::lpc_point_size, static_cast<int>(selected_lpc_points_size));
+                ImGui::EndPopup();
+            }
+            else
+            {
+                select_lpc_point_size = false;
+            }
+            left += 80;
+
+            if (show_safety_zones_3d)
+            {
+                bool active = true;
+                if (big_button(&active, win, left, 0, textual_icons::draw_polygon,
+                    "S. Zones", false, true,
+                    "Show/hide Safety Zones"))
+                {
+                    show_safety_zones_3d = false;
+                    config_file::instance().set(configurations::viewer::show_safety_zones_3d, show_safety_zones_3d);
+                }
+            }
+            else
+            {
+                bool active = false;
+                if (big_button(&active, win, left, 0, textual_icons::draw_polygon,
+                    "S. Zones", false, true,
+                    "Show/hide Safety Zones"))
+                {
+                    show_safety_zones_3d = true;
+                    config_file::instance().set(configurations::viewer::show_safety_zones_3d, show_safety_zones_3d);
+                }
+            }
+        }
 
 
         ImGui::PopStyleColor(5);
@@ -737,7 +819,8 @@ namespace rs2
                 const std::string str((std::istreambuf_iterator<char>(f)),
                                  std::istreambuf_iterator<char>());
 
-                std::string tmp = realsense_udev_rules;
+                // The generated array 'realsense_udev_rules' is not NUL-terminated...
+                std::string tmp = std::string(realsense_udev_rules, sizeof(realsense_udev_rules));
                 tmp.erase(tmp.find_last_of("\n") + 1);
                 const std::string udev = tmp;
                 float udev_file_ver{0}, built_in_file_ver{0};
@@ -774,9 +857,67 @@ namespace rs2
                     + "99-realsense-libusb.rules";
 
                 std::ofstream out(tmp_filename.c_str());
-                out << realsense_udev_rules;
+                std::string tmp = std::string(realsense_udev_rules, sizeof(realsense_udev_rules));
+                out << tmp;
                 out.close();
             }
+        }
+
+        // NVIDIA Jetson: hint the user when the viewer cannot benefit from CUDA acceleration.
+        // /etc/nv_tegra_release is the canonical L4T marker for Jetson platforms.
+        // Compile-time (RS2_USE_CUDA) and runtime (rs2_is_cuda_available) are kept separate:
+        // a CUDA-enabled build whose runtime fails to initialize (e.g. broken/mismatched CUDA
+        // stack) must not be told to "rebuild with CUDA" — the real problem is at runtime.
+        if (std::ifstream("/etc/nv_tegra_release").good())
+        {
+#ifdef RS2_USE_CUDA
+            // Built with CUDA. If the runtime cannot enumerate a GPU, surface a runtime-stack hint.
+            if (!rsutils::rs2_is_cuda_available())
+            {
+                std::string message = "Running on NVIDIA Jetson and realsense-viewer was built with CUDA,\n"
+                    "but the CUDA runtime failed to initialize (no GPU device reported).\n"
+                    "Check the CUDA driver/library stack on this device;\n"
+                    "see the SDK log for the cudaGetDeviceCount error.";
+                auto n = not_model->add_notification({ message,
+                     RS2_LOG_SEVERITY_WARN,
+                     RS2_NOTIFICATION_CATEGORY_COUNT });
+                n->enable_complex_dismiss = true;
+                n->delay_id = "jetson-cuda-runtime-init-failed";
+                n->width = 400;  // wider than default 320 so the message is not truncated
+                if (n->is_delayed()) n->dismiss(true);
+            }
+            // else: built with CUDA + GPU available -> silent (case 4)
+#else
+            // Built without CUDA: distinguish "runtime not installed" from "runtime installed but unused".
+            // /usr/local/cuda is the canonical L4T / JetPack install location for the CUDA runtime
+            // (normally a symlink to /usr/local/cuda-X.Y). A non-standard install will produce a
+            // false-positive "install runtime" popup — acceptable for a startup hint.
+            if (!directory_exists("/usr/local/cuda"))
+            {
+                std::string message = "Running on NVIDIA Jetson without the CUDA runtime installed.\n"
+                    "For better performance, install the CUDA runtime via the NVIDIA JetPack SDK.";
+                auto n = not_model->add_notification({ message,
+                     RS2_LOG_SEVERITY_WARN,
+                     RS2_NOTIFICATION_CATEGORY_COUNT });
+                n->enable_complex_dismiss = true;
+                n->delay_id = "jetson-cuda-runtime-missing";
+                n->width = 400;  // wider than default 320 so the message is not truncated
+                if (n->is_delayed()) n->dismiss(true);
+            }
+            else
+            {
+                std::string message = "Running on NVIDIA Jetson with the CUDA runtime installed,\n"
+                    "but realsense-viewer is not using CUDA.\n"
+                    "For better performance, rebuild librealsense with -DBUILD_WITH_CUDA=ON.";
+                auto n = not_model->add_notification({ message,
+                     RS2_LOG_SEVERITY_INFO,
+                     RS2_NOTIFICATION_CATEGORY_COUNT });
+                n->enable_complex_dismiss = true;
+                n->delay_id = "jetson-cuda-not-used";
+                n->width = 400;  // wider than default 320 so the message is not truncated
+                if (n->is_delayed()) n->dismiss(true);
+            }
+#endif
         }
 
 #endif
@@ -789,12 +930,14 @@ namespace rs2
         _hidden_options.emplace(RS2_OPTION_STREAM_FORMAT_FILTER);
         _hidden_options.emplace(RS2_OPTION_STREAM_INDEX_FILTER);
         _hidden_options.emplace(RS2_OPTION_FRAMES_QUEUE_SIZE);
-        _hidden_options.emplace(RS2_OPTION_SENSOR_MODE);
         _hidden_options.emplace(RS2_OPTION_NOISE_ESTIMATION);
+        _hidden_options.emplace(RS2_OPTION_REGION_OF_INTEREST);
     }
 
-    void viewer_model::update_configuration()
+    void viewer_model::update_configuration(config_file* new_cfg)
     {
+        if (new_cfg)
+            config_file::instance() = *new_cfg;
         rs2_error* e = nullptr;
         auto version = rs2_get_api_version(&e);
         if (e) rs2::error::handle(e);
@@ -864,6 +1007,14 @@ namespace rs2
 
         show_skybox = config_file::instance().get_or_default(
             configurations::performance::show_skybox, true);
+
+        selected_lpc_points_size = static_cast<lpc_points_size>(config_file::instance().get_or_default(
+            configurations::viewer::lpc_point_size, static_cast<int>(lpc_points_size::lpc_small)
+        ));
+
+        show_safety_zones_3d = config_file::instance().get_or_default(
+            configurations::viewer::show_safety_zones_3d, true
+        );
     }
 
 
@@ -881,8 +1032,7 @@ namespace rs2
         syncer = std::make_shared<syncer_model>();
         updates = std::make_shared<updates_model>();
         reset_camera();
-        rs2_error* e = nullptr;
-        not_model->add_log( "librealsense version: " + api_version_to_string( rs2_get_api_version( &e ) ) + "\n" );
+        not_model->add_log( rsutils::string::from() << "librealsense version: " << RS2_API_FULL_VERSION_STR << "\n" );
 
         update_configuration();
 
@@ -916,6 +1066,11 @@ namespace rs2
                 selected_depth_source_uid = -1;
             }
 
+            if (selected_labeled_points_source_uid == i)
+            {
+                last_labeled_points = labeled_points();
+            }
+
             if (selected_tex_source_uid == i)
             {
                 last_texture.reset();
@@ -944,7 +1099,7 @@ namespace rs2
     {
         auto font_dynamic = window.get_font();
 
-        ImGui_ScopePushFont(font_dynamic);
+        RsImGui_ScopePushFont(font_dynamic);
         ImGui::PushStyleColor(ImGuiCol_PopupBg, sensor_bg);
         ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, white);
         ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
@@ -1087,7 +1242,7 @@ namespace rs2
     void viewer_model::show_icon(ImFont* font_18, const char* label_str, const char* text, int x, int y, int id,
         const ImVec4& text_color, const std::string& tooltip)
     {
-        ImGui_ScopePushFont(font_18);
+        RsImGui_ScopePushFont(font_18);
 
         std::string label = rsutils::string::from() << label_str << id;
 
@@ -1096,7 +1251,7 @@ namespace rs2
         ImGui::Text("%s", text);
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered() && tooltip != "")
-            ImGui::SetTooltip("%s", tooltip.c_str());
+            RsImGui::CustomTooltip("%s", tooltip.c_str());
 
     }
     void viewer_model::show_paused_icon(ImFont* font_18, int x, int y, int id)
@@ -1170,10 +1325,37 @@ namespace rs2
         ImGui::SetCursorScreenPos(pos);
     }
 
-    // Generate streams layout, creates a grid-like layout with factor amount of columns
+    // Serial number of the camera a stream belongs to, used to key the saved tile arrangement
+    static std::string stream_serial(const stream_model* sm)
+    {
+        if (sm && sm->dev && sm->dev->dev && sm->dev->dev.supports(RS2_CAMERA_INFO_SERIAL_NUMBER))
+            return sm->dev->dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+        return {};
+    }
+
+    // A stable per-camera identifier for a stream (type + index), so a saved arrangement can
+    // be matched back to the same streams across sessions / re-attach.
+    static std::string stream_descriptor(const stream_model* sm)
+    {
+        if (!sm) return {};
+        return std::to_string(static_cast<int>(sm->profile.stream_type())) + "_" +
+               std::to_string(sm->profile.stream_index());
+    }
+
+    // The tile title bar is drawn in the reserved strip above the frame rect. The drag grab
+    // area (and its drawn outline) extends upward by this much to include the title bar.
+    static constexpr float TILE_HEADER_HEIGHT = 32.f;
+    static rect tile_grab_rect(const rect& r)
+    {
+        return rect{ r.x, r.y - TILE_HEADER_HEIGHT, r.w, r.h + TILE_HEADER_HEIGHT };
+    }
+
+    // Generate streams layout, creates a grid-like layout with factor amount of columns.
+    // The streams are assigned to cells column-major (top-to-bottom, then next column) in
+    // the given order. The order is taken as-is (default sort or the user's arrangement).
     std::map<int, rect> generate_layout(const rect& r,
         int top_bar_height, size_t factor,
-        const std::set<stream_model*>& active_streams,
+        const std::vector<stream_model*>& streams_ordered,
         std::map<stream_model*, int>& stream_index
     )
     {
@@ -1181,33 +1363,18 @@ namespace rs2
         if (factor == 0) return results;
 
         // Calc the number of rows
-        auto complement = ceil((float)active_streams.size() / factor);
+        auto complement = ceil((float)streams_ordered.size() / factor);
 
         auto cell_width = static_cast<float>(r.w / factor);
         auto cell_height = static_cast<float>(r.h / complement);
 
-        // using the active streams sorted acc to stream type and stream index
-        // typical order will then be: depth, color, ir1, ir2, motion....
-        std::vector<stream_model*> active_streams_ordered;
-        for (auto&& active_stream : active_streams)
-        {
-            active_streams_ordered.push_back(active_stream);
-        }
-
-        std::sort(active_streams_ordered.begin(), active_streams_ordered.end(),
-            [](const stream_model* sm1, const stream_model* sm2)
-            {
-                return (sm1->profile.stream_type() < sm2->profile.stream_type()) ||
-                    ((sm1->profile.stream_type() == sm2->profile.stream_type()) && (sm1->profile.stream_index() < sm2->profile.stream_index()));
-            });
-
-        auto it = active_streams_ordered.begin();
+        auto it = streams_ordered.begin();
         for (auto x = 0; x < factor; x++)
         {
             for (auto y = 0; y < complement; y++)
             {
                 // There might be spare boxes at the end (3 streams in 2x2 array for example)
-                if (it == active_streams_ordered.end()) break;
+                if (it == streams_ordered.end()) break;
 
                 rect rxy = { r.x + x * cell_width, r.y + y * cell_height + top_bar_height,
                     cell_width, cell_height - top_bar_height };
@@ -1229,9 +1396,163 @@ namespace rs2
         return res;
     }
 
+    void force_minimum_size_for_display(rs2::stream_model& model)
+    {
+        // patch for safety sensor
+        if (model.profile.stream_type() == RS2_STREAM_SAFETY || 
+            model.profile.stream_type() == RS2_STREAM_LABELED_POINT_CLOUD)
+        {
+            // The following values have been chosen so that the safety stream's
+            // metadata could be shown entirely (without that,, the safety window
+            // is too thin to permit the user to see the metadata fields
+            model.size.x = 7.f;
+            model.size.y = 10.f;
+        }
+    }
+
+    // Order the active streams for display. The default order is by stream type then index
+    // (depth, color, ir1, ir2, motion...). On top of that, each camera's tiles are placed
+    // according to the arrangement the user saved for that camera's serial (loaded from the
+    // config file); cameras with no saved arrangement keep the default order. Live drag
+    // re-arrangements are kept in the runtime _streams_order between frames.
+    std::vector<stream_model*> viewer_model::order_active_streams(
+        const std::set<stream_model*>& active_streams,
+        const std::map<stream_model*, int>& stream_index)
+    {
+        std::map<int, stream_model*> by_key;
+        for (auto&& sm : active_streams)
+            by_key[stream_index.at(sm)] = sm;
+
+        // Default order: by stream type, then stream index
+        std::vector<stream_model*> default_ordered(active_streams.begin(), active_streams.end());
+        std::sort(default_ordered.begin(), default_ordered.end(),
+            [](const stream_model* sm1, const stream_model* sm2)
+            {
+                return (sm1->profile.stream_type() < sm2->profile.stream_type()) ||
+                    ((sm1->profile.stream_type() == sm2->profile.stream_type()) && (sm1->profile.stream_index() < sm2->profile.stream_index()));
+            });
+
+        // Drop streams that are no longer active from the runtime order
+        _streams_order.erase(
+            std::remove_if(_streams_order.begin(), _streams_order.end(),
+                [&](int key) { return by_key.find(key) == by_key.end(); }),
+            _streams_order.end());
+
+        // Append newly-activated streams, keeping their default relative order
+        for (auto&& sm : default_ordered)
+        {
+            auto key = stream_index.at(sm);
+            if (std::find(_streams_order.begin(), _streams_order.end(), key) == _streams_order.end())
+                _streams_order.push_back(key);
+        }
+
+        // Apply each camera's saved arrangement: reorder a camera's streams among the slots
+        // they already occupy, following the saved descriptor order. Streams not present in
+        // the saved order (e.g. newly enabled) keep their relative position at the end.
+        std::map<std::string, std::vector<size_t>> serial_positions;
+        for (size_t i = 0; i < _streams_order.size(); i++)
+        {
+            auto kit = by_key.find(_streams_order[i]);
+            if (kit == by_key.end()) continue;
+            serial_positions[stream_serial(kit->second)].push_back(i);
+        }
+
+        for (auto&& sp : serial_positions)
+        {
+            const std::string& serial = sp.first;
+            if (serial.empty()) continue;
+
+            auto saved = get_saved_arrangement(serial);
+            if (saved.empty()) continue;
+
+            auto& positions = sp.second;
+            std::vector<int> remaining;
+            for (auto pos : positions) remaining.push_back(_streams_order[pos]);
+
+            std::vector<int> reordered;
+            for (auto&& desc : saved)
+            {
+                for (auto it = remaining.begin(); it != remaining.end(); ++it)
+                {
+                    auto kit = by_key.find(*it);
+                    if (kit != by_key.end() && stream_descriptor(kit->second) == desc)
+                    {
+                        reordered.push_back(*it);
+                        remaining.erase(it);
+                        break;
+                    }
+                }
+            }
+            for (auto key : remaining) reordered.push_back(key);
+
+            for (size_t k = 0; k < positions.size(); k++)
+                _streams_order[positions[k]] = reordered[k];
+        }
+
+        std::vector<stream_model*> ordered;
+        ordered.reserve(_streams_order.size());
+        for (auto key : _streams_order)
+        {
+            auto kit = by_key.find(key);
+            if (kit != by_key.end())
+                ordered.push_back(kit->second);
+        }
+
+        return ordered;
+    }
+
+    // Read a camera's saved tile arrangement from the config (cached in memory). Returns an
+    // empty list when the camera has no saved arrangement.
+    std::vector<std::string> viewer_model::get_saved_arrangement(const std::string& serial)
+    {
+        auto it = _stream_arrangement_by_serial.find(serial);
+        if (it != _stream_arrangement_by_serial.end())
+            return it->second;
+
+        std::vector<std::string> order;
+        std::string key = "stream_layout." + serial;
+        auto& cfg = config_file::instance();
+        if (cfg.contains(key.c_str()))
+            order = rsutils::string::split(cfg.get(key.c_str(), ""), ',');
+        _stream_arrangement_by_serial[serial] = order;
+        return order;
+    }
+
+    // Save the current arrangement of every active camera to the config, keyed by serial.
+    // Derived from the runtime _streams_order, so it captures the latest drag re-arrangement.
+    void viewer_model::persist_stream_arrangements()
+    {
+        std::map<std::string, std::vector<std::string>> by_serial;
+        for (auto key : _streams_order)
+        {
+            auto it = streams.find(key);
+            if (it == streams.end()) continue;
+            const stream_model* sm = &it->second;
+            auto serial = stream_serial(sm);
+            if (serial.empty()) continue;
+            by_serial[serial].push_back(stream_descriptor(sm));
+        }
+
+        auto& cfg = config_file::instance();
+        for (auto&& kv : by_serial)
+        {
+            _stream_arrangement_by_serial[kv.first] = kv.second;
+
+            std::string joined;
+            for (size_t i = 0; i < kv.second.size(); i++)
+            {
+                if (i) joined += ",";
+                joined += kv.second[i];
+            }
+            std::string key = "stream_layout." + kv.first;
+            cfg.set(key.c_str(), joined.c_str());
+        }
+    }
+
     std::map<int, rect> viewer_model::calc_layout(const rect& r)
     {
-        const int top_bar_height = 32;
+        // The reserved title-bar strip at the top of each cell (see tile_grab_rect)
+        const int top_bar_height = static_cast<int>(TILE_HEADER_HEIGHT);
 
         std::set<stream_model*> active_streams;
         std::map<stream_model*, int> stream_index;
@@ -1239,6 +1560,8 @@ namespace rs2
         {
             if (stream.second.is_stream_visible())
             {
+                force_minimum_size_for_display(stream.second);
+
                 active_streams.insert(&stream.second);
                 stream_index[&stream.second] = stream.first;
             }
@@ -1258,11 +1581,13 @@ namespace rs2
         }
         else
         {
+            auto streams_ordered = order_active_streams(active_streams, stream_index);
+
             // Go over all available fx(something) layouts
-            for (size_t f = 1; f <= active_streams.size(); f++)
+            for (size_t f = 1; f <= streams_ordered.size(); f++)
             {
                 auto l = generate_layout(r, top_bar_height, f,
-                    active_streams, stream_index);
+                    streams_ordered, stream_index);
 
                 // Keep the "best" layout in result
                 if (evaluate_layout(l) > evaluate_layout(results))
@@ -1273,10 +1598,64 @@ namespace rs2
         return get_interpolated_layout(results);
     }
 
+    // Drag one stream tile onto another to swap their positions. The swap is recorded in
+    // _streams_order and takes effect on the next calc_layout (animated by the layout
+    // interpolation). Active only while allow_streams_reorder is on.
+    void viewer_model::handle_streams_reorder(const std::map<int, rect>& layout, const mouse_info& mouse)
+    {
+        const bool down = mouse.mouse_down[0];
+        const float2 cursor = mouse.cursor;
+
+        // Find the tile (frame or its title bar) currently under the cursor
+        int hovered = -1;
+        for (auto&& kvp : layout)
+        {
+            if (tile_grab_rect(kvp.second).contains(cursor))
+            {
+                hovered = kvp.first;
+                break;
+            }
+        }
+
+        if (down && !_prev_reorder_mouse_down)
+        {
+            // Mouse pressed - start a potential drag from the hovered tile
+            _dragged_stream = hovered;
+            _drag_origin = cursor;
+            _is_dragging_stream = false;
+        }
+        else if (down && _dragged_stream != -1)
+        {
+            // Held - promote to an actual drag once moved past a small threshold
+            if ((cursor - _drag_origin).length() > 6.f)
+                _is_dragging_stream = true;
+        }
+        else if (!down && _prev_reorder_mouse_down)
+        {
+            // Released - perform the swap if dropped over a different tile
+            if (_is_dragging_stream && _dragged_stream != -1 && hovered != -1 && hovered != _dragged_stream)
+            {
+                auto it_a = std::find(_streams_order.begin(), _streams_order.end(), _dragged_stream);
+                auto it_b = std::find(_streams_order.begin(), _streams_order.end(), hovered);
+                if (it_a != _streams_order.end() && it_b != _streams_order.end())
+                {
+                    std::iter_swap(it_a, it_b);
+                    // Remember this camera's new tile arrangement (per serial) in the config
+                    persist_stream_arrangements();
+                }
+            }
+            _dragged_stream = -1;
+            _is_dragging_stream = false;
+        }
+
+        _prev_reorder_mouse_down = down;
+    }
+
     rs2::frame viewer_model::handle_ready_frames(const rect& viewer_rect, ux_window& window, int devices, std::string& error_message)
     {
         std::shared_ptr<texture_buffer> texture_frame = nullptr;
         points p;
+        labeled_points lab_points;
         frame f{};
         gc_streams();
 
@@ -1330,6 +1709,10 @@ namespace rs2
             for(auto&& f : last_frames)
                 not_model->output.update_dashboards(f.second);
 
+            // Process any object detection frames and update detected_objects overlays
+            if( !paused )
+                process_object_detection_frames( last_frames );
+
             for( auto && frame : last_frames )
             {
                 auto f = frame.second;
@@ -1341,10 +1724,15 @@ namespace rs2
                     continue;
                 }
 
+                if (f.is<labeled_points>())
+                {
+                    if (!paused)
+                        lab_points = f.as<labeled_points>();
+                }
+
                 auto texture = upload_frame( std::move( f ) );
 
-                if( ( selected_tex_source_uid == -1 && f.get_profile().format() == RS2_FORMAT_Z16 )
-                    || ( f.get_profile().format() != RS2_FORMAT_ANY && is_3d_texture_source( f ) ) )
+                if ( should_texture_frame_be_updated(f) )
                 {
                     texture_frame = texture;
                 }
@@ -1363,7 +1751,7 @@ namespace rs2
 
         auto flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
             | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar
-            | ImGuiWindowFlags_NoSavedSettings
+            | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus
             | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 5, 5 });
@@ -1371,12 +1759,13 @@ namespace rs2
 
         ImGui::SetNextWindowPos({ viewer_rect.x, viewer_rect.y });
         ImGui::SetNextWindowSize({ viewer_rect.w, viewer_rect.h });
-
-        ImGui::Begin("Viewport", nullptr, { viewer_rect.w, viewer_rect.h }, 0.f, flags);
+        ImGui::SetNextWindowBgAlpha(0.f);
+        ImGui::Begin("Viewport", nullptr,flags);
 
         try
         {
-            draw_viewport( viewer_rect, window, devices, error_message, texture_frame, p );
+            draw_viewport( viewer_rect, window, devices, error_message, 
+                texture_frame, p, lab_points );
 
             modal_notification_on = not_model->draw( window,
                                                      static_cast< int >( window.width() ),
@@ -1497,7 +1886,7 @@ namespace rs2
             auto relative_mouse_y = ImGui::GetMousePos().y - top_y_ruler;
             auto y = (bottom_y_ruler - top_y_ruler) - relative_mouse_y;
             ss << std::fixed << std::setprecision(2) << (y / ratio) << ruler_units;
-            ImGui::SetTooltip("%s", ss.str().c_str());
+            RsImGui::CustomTooltip("%s", ss.str().c_str());
             colored_ruler_opac = 1.f;
             numbered_ruler_background_opac = hovered_numbered_ruler_opac;
         }
@@ -1628,6 +2017,26 @@ namespace rs2
         {
             show_no_stream_overlay(font2, static_cast<int>(view_rect.x), static_cast<int>(view_rect.y), static_cast<int>(win.width()), static_cast<int>(win.height() - output_height));
         }
+
+        // While in re-arrange mode we drive tile drag-to-swap and suppress the per-tile
+        // mouse interactions (zoom/pan/ruler) by feeding the tiles a neutral mouse.
+        const bool reorder_mode = allow_streams_reorder && !fullscreen && layout.size() > 1;
+        mouse_info neutral_mouse{};
+        neutral_mouse.cursor = neutral_mouse.prev_cursor = { -1e5f, -1e5f };
+        if (reorder_mode)
+        {
+            handle_streams_reorder(layout, mouse);
+        }
+        else
+        {
+            // Clear any drag state so a drag interrupted by leaving re-arrange mode (toggle
+            // off, fullscreen, last stream closed) can't trigger a phantom swap on re-entry.
+            _dragged_stream = -1;
+            _is_dragging_stream = false;
+            _prev_reorder_mouse_down = false;
+        }
+        const mouse_info& active_mouse = reorder_mode ? neutral_mouse : mouse;
+
         for (auto &&kvp : layout)
         {
             auto&& view_rect = kvp.second;
@@ -1636,7 +2045,9 @@ namespace rs2
             auto&& stream_size = stream_mv.size;
             auto stream_rect = view_rect.adjust_ratio(stream_size).grow(-3);
 
-            stream_mv.show_frame(stream_rect, mouse, error_message);
+            if (should_render_frame(stream_mv)) {
+                stream_mv.show_frame(stream_rect, active_mouse, error_message);
+            }
 
             auto p = stream_mv.dev->dev.as<playback>();
             float posX = stream_rect.x + 9;
@@ -1654,7 +2065,7 @@ namespace rs2
             }
 
             stream_mv.show_stream_header(font1, stream_rect, *this);
-            stream_mv.show_stream_footer(font1, stream_rect, mouse, streams, *this);
+            stream_mv.show_stream_footer(font1, stream_rect, active_mouse, streams, *this);
 
 
             if (val_in_range(stream_mv.profile.format(), { RS2_FORMAT_RAW10 , RS2_FORMAT_RAW16, RS2_FORMAT_MJPEG }))
@@ -1679,15 +2090,45 @@ namespace rs2
                 {
                     case RS2_STREAM_GYRO: /* Fall Through */
                     case RS2_STREAM_ACCEL:
-                    {
-                        auto motion = streams[stream].texture->get_last_frame().as<motion_frame>();
-                        if (motion.get())
+                        if( rs2::frame frame = streams[stream].texture->get_last_frame() )
                         {
-                            auto axis = motion.get_motion_data();
-                            stream_mv.show_stream_imu(font1, stream_rect, axis, mouse);
+                            auto motion = frame.as< motion_frame >();
+                            if( motion.get() )
+                            {
+                                auto axis = motion.get_motion_data();
+                                stream_mv.show_stream_imu( font1,
+                                                           stream_rect,
+                                                           axis,
+                                                           active_mouse,
+                                                           stream_type == RS2_STREAM_GYRO ? "Radians/Sec" : "Meter/Sec^2" );
+                            }
                         }
                         break;
-                    }
+
+                    case RS2_STREAM_MOTION:
+                        if( rs2::frame frame = streams[stream].texture->get_last_frame() )
+                        {
+                            auto & motion = *reinterpret_cast< const rs2_combined_motion * >( frame.get_data() );
+                            auto height = stream_mv.show_stream_imu( font1,
+                                                                     stream_rect,
+                                                                     { (float)motion.linear_acceleration.x,
+                                                                       (float)motion.linear_acceleration.y,
+                                                                       (float)motion.linear_acceleration.z },
+                                                                     active_mouse,
+                                                                     "Meter/Sec^2",
+                                                                     "Linear Acceletion" );
+                            stream_mv.show_stream_imu( font1,
+                                                       stream_rect,
+                                                       { (float)motion.angular_velocity.x,
+                                                         (float)motion.angular_velocity.y,
+                                                         (float)motion.angular_velocity.z },
+                                                       active_mouse,
+                                                       "Radians/Sec",
+                                                       "Angular Velocity",
+                                                       height + 9 );
+                        }
+                        break;
+
                     case RS2_STREAM_POSE:
                     {
                         if (streams[stream].show_stream_details)
@@ -1705,6 +2146,16 @@ namespace rs2
 
                         break;
                     }
+                    case RS2_STREAM_OCCUPANCY:
+                        auto frame = streams[stream].texture->get_last_frame();
+                        auto zoom = streams[stream].dev->normalized_zoom.w;
+                        if (frame && frame.get_data() && streams[stream].show_safety_zones_2d && zoom == 1)
+                        {
+                            draw_zone_2d(Zone::Diagnostic, stream_rect, frame);
+                            draw_zone_2d(Zone::Warning, stream_rect, frame);
+                            draw_zone_2d(Zone::Danger, stream_rect, frame);
+                        }
+                        break;
                 }
             }
 
@@ -1785,22 +2236,30 @@ namespace rs2
                     rect const & normalized_bbox = stream_mv.profile.stream_type() == RS2_STREAM_DEPTH
                         ? object.normalized_depth_bbox
                         : object.normalized_color_bbox;
-                    rect bbox = normalized_bbox.unnormalize( stream_rect );
-                    bbox.grow( 10, 5 );  // Allow more text, and easier identification of the face
+                    rect const unbbox = normalized_bbox.unnormalize( stream_rect );
+                    rect bbox = unbbox.grow( 10, 5 );  // Allow more text, and easier identification of the face
 
-                    float const max_depth = 2.f;
-                    float const min_depth = 0.8f;
-                    float const depth_range = max_depth - min_depth;
-                    float usable_depth = std::min( object.mean_depth, max_depth );
-                    float a = 0.75f * (max_depth - usable_depth) / depth_range + 0.25f;
+                    float a = 0.75f;
+                    auto frame_color = colors[2].first; // Green by default, good contrast.
+                    if( object.type == object_type::face )
+                    {  // For faces, the bounding box is drawn with an opacity according to the face's distance - the
+                       // farther it is, the more transparent it is, so that closer faces are more visible and easier to identify
+                        float const max_depth = 2.f;
+                        float const min_depth = 0.8f;
+                        float const depth_range = max_depth - min_depth;
+                        float usable_depth = std::min( object.mean_depth, max_depth );
+                        a = 0.75f * (max_depth - usable_depth) / depth_range + 0.25f;
+                        frame_color = get_color( object ); // Each face gets a unique color, so that it's easier to identify them across frames
+                    }
 
                     // Don't draw text in boxes that are too small...
                     auto h = bbox.h;
-                    ImGui::PushStyleColor( ImGuiCol_Text, ImColor( 1.f, 1.f, 1.f, a ) );
+                    ImGui::PushStyleColor( ImGuiCol_Text, ImVec4( 1.f, 1.f, 1.f, a ) );
                     ImColor bg( dark_sensor_bg.x, dark_sensor_bg.y, dark_sensor_bg.z, dark_sensor_bg.w * a );
 
                     if( fabs(object.mean_depth) > 0.f )
                     {
+                        ImGui::PushFont( font2 );
                         std::string str = rsutils::string::from() << std::setprecision( 2 ) << object.mean_depth << " m";
                         auto size = ImGui::CalcTextSize( str.c_str() );
                         if( size.y < h  &&  size.x < bbox.w )
@@ -1813,6 +2272,7 @@ namespace rs2
                             ImGui::Text("%s",  str.c_str() );
                             h -= size.y;
                         }
+                        ImGui::PopFont();
                     }
                     if( ! object.name.empty() )
                     {
@@ -1832,15 +2292,15 @@ namespace rs2
                     ImGui::PopStyleColor();
 
                     // The rectangle itself is always drawn, in the same color as the text
-                    auto frame_color = get_color( object );
                     glColor3f( a * frame_color.Value.x, a * frame_color.Value.y, a * frame_color.Value.z );
-                    draw_rect( bbox );
+                    draw_rect( bbox, 2 );
+
                 }
             }
 
             glColor3f(header_window_bg.x, header_window_bg.y, header_window_bg.z);
-            stream_rect.y -= 32;
-            stream_rect.h += 32;
+            stream_rect.y -= TILE_HEADER_HEIGHT;
+            stream_rect.h += TILE_HEADER_HEIGHT;
             stream_rect.w += 1;
             draw_rect(stream_rect);
 
@@ -1883,15 +2343,59 @@ namespace rs2
                     if (!distances.empty())
                     {
                         ruler_length = calculate_ruler_max_distance(distances);
-                        draw_color_ruler(mouse, streams[stream], stream_rect, rgb_per_distance_vec, ruler_length, depth_units);
+                        draw_color_ruler(active_mouse, streams[stream], stream_rect, rgb_per_distance_vec, ruler_length, depth_units);
                     }
                 }
             }
         }
+
+        // Re-arrange mode: outline the tiles and show drag-to-swap feedback. The grab area
+        // includes the title bar strip above the frame, so the outlines do too.
+        if (reorder_mode)
+        {
+            for (auto&& kvp : layout)
+            {
+                glColor3f(light_blue.x, light_blue.y, light_blue.z);
+                draw_rect(tile_grab_rect(kvp.second).grow(-3), 1);
+            }
+
+            if (_is_dragging_stream && _dragged_stream != -1)
+            {
+                // The tile being dragged
+                auto src = layout.find(_dragged_stream);
+                if (src != layout.end())
+                {
+                    glColor3f(light_grey.x, light_grey.y, light_grey.z);
+                    draw_rect(tile_grab_rect(src->second).grow(-3), 3);
+                }
+
+                // The drop target under the cursor (frame or its title bar)
+                for (auto&& kvp : layout)
+                {
+                    if (kvp.first != _dragged_stream && tile_grab_rect(kvp.second).contains(mouse.cursor))
+                    {
+                        glColor3f(light_blue.x, light_blue.y, light_blue.z);
+                        draw_rect(tile_grab_rect(kvp.second).grow(-3), 4);
+                        break;
+                    }
+                }
+
+                // A small ghost rectangle that follows the cursor
+                if (src != layout.end())
+                {
+                    auto gw = src->second.w * 0.4f;
+                    auto gh = src->second.h * 0.4f;
+                    rect ghost{ mouse.cursor.x - gw / 2.f, mouse.cursor.y - gh / 2.f, gw, gh };
+                    glColor3f(white.x, white.y, white.z);
+                    draw_rect(ghost, 2);
+                }
+            }
+            glColor3f(1.f, 1.f, 1.f);
+        }
     }
 
     void viewer_model::render_3d_view(const rect& viewer_rect, ux_window& win,
-        std::shared_ptr<texture_buffer> texture, rs2::points points)
+        std::shared_ptr<texture_buffer> texture, rs2::points points, rs2::labeled_points labeled_points)
     {
         auto top_bar_height = 60.f;
 
@@ -1902,6 +2406,11 @@ namespace rs2
         if (texture)
         {
             last_texture = texture;
+        }
+
+        if (labeled_points)
+        {
+            last_labeled_points = labeled_points;
         }
 
         auto bottom_y = win.framebuf_height() - viewer_rect.y - viewer_rect.h;
@@ -1970,21 +2479,6 @@ namespace rs2
             glEnd();
             glPopAttrib();
         }
-
-        auto x = static_cast<float>(-M_PI / 2);
-        float _rx[4][4] = {
-            { 1 , 0, 0, 0 },
-            { 0, static_cast<float>(cos(x)), static_cast<float>(-sin(x)), 0 },
-            { 0, static_cast<float>(sin(x)), static_cast<float>(cos(x)), 0 },
-            { 0, 0, 0, 1 }
-        };
-        static const double z = M_PI;
-        static float _rz[4][4] = {
-            { float(cos(z)), float(-sin(z)),0, 0 },
-            { float(sin(z)), float(cos(z)), 0, 0 },
-            { 0 , 0, 1, 0 },
-            { 0, 0, 0, 1 }
-        };
 
         {
             float tiles = 24;
@@ -2197,6 +2691,11 @@ namespace rs2
 
         check_gl_error();
 
+        if (last_labeled_points)
+        {
+            draw_3d_labeled_points(viewer_rect, last_labeled_points);
+        }
+
         _measurements.draw(win);
 
         glPopMatrix();
@@ -2207,10 +2706,18 @@ namespace rs2
 
         glDisable(GL_DEPTH_TEST);
 
-        if (ImGui::IsKeyPressed('R') || ImGui::IsKeyPressed('r'))
+        if (ImGui::GetIO().KeysDown[ImGuiKey_R])
         {
             reset_camera();
         }
+    }
+
+    bool viewer_model::should_render_frame(const rs2::stream_model& model) const
+    {
+        if (model.profile.stream_type() == RS2_STREAM_SAFETY)
+            return false;
+
+        return true;
     }
 
     void viewer_model::show_top_bar(ux_window& window, const rect& viewer_rect, const device_models_list& devices)
@@ -2229,7 +2736,10 @@ namespace rs2
         ImGui::PushFont(window.get_large_font());
         ImGui::PushStyleColor(ImGuiCol_Border, black);
 
-        int buttons = window.is_fullscreen() ? 4 : 3;
+        // The re-arrange-tiles toggle always occupies a slot immediately to the left of the
+        // Settings button. It is enabled in 2D view and disabled (greyed out) in 3D view.
+        const int rearrange_slot = 1;
+        int buttons = (window.is_fullscreen() ? 4 : 3) + rearrange_slot;
 
         ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons));
         ImGui::PushStyleColor(ImGuiCol_Text, is_3d_view ? light_grey : light_blue);
@@ -2257,43 +2767,67 @@ namespace rs2
         ImGui::PopStyleColor(2);
         ImGui::SameLine();
 
-        ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 2));
+        // Re-arrange tiles toggle, placed next to the Settings button. Disabled in 3D view.
+        {
+            ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 2));
+            ImGui::BeginDisabled(is_3d_view);
+            ImGui::PushStyleColor(ImGuiCol_Text, allow_streams_reorder ? light_blue : light_grey);
+            ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, allow_streams_reorder ? light_blue : light_grey);
+            if (ImGui::Button(textual_icons::up_down_left_right, { panel_y, panel_y }))
+            {
+                allow_streams_reorder = !allow_streams_reorder;
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::EndDisabled();
+            if (!is_3d_view && ImGui::IsItemHovered())
+            {
+                // Match the Settings tooltip font (base font, not the large toolbar font)
+                ImGui::PushFont(window.get_font());
+                RsImGui::CustomTooltip("%s", allow_streams_reorder
+                    ? "Re-arrange tiles: ON - drag a stream tile onto another to swap them.\nArrangement is saved per camera."
+                    : "Re-arrange tiles - drag stream tiles to swap their positions.\nArrangement is saved per camera.");
+                ImGui::PopFont();
+                window.link_hovered();
+            }
+            ImGui::SameLine();
+        }
+
+        ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 2 - rearrange_slot));
 
         static bool settings_open = false;
         ImGui::PushStyleColor(ImGuiCol_Text, !settings_open ? light_grey : light_blue);
         ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, !settings_open ? light_grey : light_blue);
 
-        if (ImGui::Button(u8"\uf013", { panel_y,panel_y }))
+        if (ImGui::Button(textual_icons::cog, { panel_y,panel_y }))
         {
             ImGui::OpenPopup("More Options");
         }
-
+        ImGui::PopFont();
         if (ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("%s", "More Options...");
+            RsImGui::CustomTooltip("%s", "More Options...");
         }
 
         if (window.is_fullscreen())
         {
             ImGui::SameLine();
-            ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 4));
+            ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 4 - rearrange_slot));
 
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, button_color);
             ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
             ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, light_red);
-            if (ImGui::Button(textual_icons::exit, { panel_y,panel_y }))
+            if (ImGui::Button(textual_icons::power_off, { panel_y,panel_y }))
             {
                 exit(0);
             }
             if (ImGui::IsItemHovered())
             {
-                ImGui::SetTooltip("Exit the App");
+                RsImGui::CustomTooltip("Exit the App");
                 window.link_hovered();
             }
             ImGui::PopStyleColor(3);
         }
 
-        ImGui::PopFont();
 
         ImGui::PushStyleColor(ImGuiCol_Text, black);
         ImGui::PushStyleColor(ImGuiCol_PopupBg, almost_white_bg);
@@ -2303,7 +2837,7 @@ namespace rs2
 
         ImGui::PushFont(window.get_font());
 
-        const char* menu_items[] = { "Report Issue", "Intel Store", "Settings", "About" };
+        const char* menu_items[] = { "Report Issue", "RS Store", "Settings", "About" };
         bool open_settings_popup = false;
         bool open_about_popup = false;
 
@@ -2325,7 +2859,7 @@ namespace rs2
 
             if( ImGui::Selectable( menu_items[1] ) )
             {
-                open_url("https://store.intelrealsense.com/");
+                open_url("https://store.realsenseai.com/");
             }
 
             if( ImGui::Selectable( menu_items[2] ) )
@@ -2373,9 +2907,9 @@ namespace rs2
             ImGui::SetNextWindowSize({ w, h });
 
             flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar;
 
-            ImGui_ScopePushFont(window.get_font());
+            RsImGui_ScopePushFont(window.get_font());
             ImGui::PushStyleColor(ImGuiCol_PopupBg, sensor_bg);
             ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, white);
             ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
@@ -2440,7 +2974,12 @@ namespace rs2
 
                 ImGui::SetCursorScreenPos({ (float)(x0 + 15), (float)(y0 + 65) });
                 ImGui::Separator();
-
+                ImGui::PushStyleColor(ImGuiCol_Text, white);
+                ImGui::PushStyleColor(ImGuiCol_PopupBg, dark_window_background);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(5, 5));
+                ImVec2 child_size = ImVec2(0, ImGui::GetContentRegionAvail().y-50);
+                if (ImGui::BeginChild("ScrollableRegion", child_size, true, ImGuiWindowFlags_AlwaysVerticalScrollbar))
+                {
                 if (tab == 0)
                 {
                     int recording_setting = temp_cfg.get(configurations::record::file_save_mode);
@@ -2472,12 +3011,12 @@ namespace rs2
 
                     ImGui::Text("ROS-bag Compression:");
                     int recording_compression = temp_cfg.get(configurations::record::compression_mode);
-                    if (ImGui::RadioButton("Always Compress (might cause frame drops)", recording_compression == 0))
+                    if (ImGui::RadioButton("Always Compress (only playable using the SDK, might cause frame drops)", recording_compression == 0))
                     {
                         recording_compression = 0;
                         temp_cfg.set(configurations::record::compression_mode, recording_compression);
                     }
-                    if (ImGui::RadioButton("Never Compress (larger .bag file size)", recording_compression == 1))
+                    if (ImGui::RadioButton("Never Compress (larger file size)", recording_compression == 1))
                     {
                         recording_compression = 1;
                         temp_cfg.set(configurations::record::compression_mode, recording_compression);
@@ -2495,7 +3034,7 @@ namespace rs2
                     int font_samples = temp_cfg.get(configurations::performance::font_oversample);
                     ImGui::Text("Font Samples: ");
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Increased font samples produce nicer text, but require more GPU memory, sometimes resulting in boxes instead of font characters");
+                        RsImGui::CustomTooltip("Increased font samples produce nicer text, but require more GPU memory, sometimes resulting in boxes instead of font characters");
 
                     ImGui::SameLine();
                     ImGui::PushItemWidth(80);
@@ -2512,7 +3051,7 @@ namespace rs2
                     int font_size = temp_cfg.get( configurations::window::font_size );
                     ImGui::Text( "Font Size: " );
                     if( ImGui::IsItemHovered() )
-                        ImGui::SetTooltip( "Viewer Font Size" );
+                        RsImGui::CustomTooltip( "Viewer Font Size" );
                     
                     ImGui::SameLine();
                     ImGui::PushItemWidth( 80 );
@@ -2533,7 +3072,7 @@ namespace rs2
                         temp_cfg.set(configurations::performance::glsl_for_rendering, gpu_rendering);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Using OpenGL 3 shaders is a widely supported way to boost rendering speeds on modern GPUs.");
+                        RsImGui::CustomTooltip("Using OpenGL 3 shaders is a widely supported way to boost rendering speeds on modern GPUs.");
 
                     bool gpu_processing = temp_cfg.get(configurations::performance::glsl_for_processing);
                     if (ImGui::Checkbox("Use GLSL for Processing", &gpu_processing))
@@ -2542,12 +3081,15 @@ namespace rs2
                         temp_cfg.set(configurations::performance::glsl_for_processing, gpu_processing);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Using OpenGL 3 shaders for depth data processing can reduce CPU utilisation.");
+                        RsImGui::CustomTooltip("Using OpenGL 3 shaders for depth data processing can reduce CPU utilisation.");
 
                     if (gpu_processing && !gpu_rendering)
                     {
                         ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
-                        ImGui::Text(u8"\uf071 Using GLSL for processing but not for rendering can reduce CPU utilisation, but is likely to hurt overall performance!");
+                        std::string excl_icon_str = std::string(rsutils::string::from()
+                            << textual_icons::exclamation_triangle
+                            << " Using GLSL for processing but not for rendering can reduce CPU utilisation, but is likely to hurt overall performance!");
+                        ImGui::Text("%s", excl_icon_str.c_str());
                         ImGui::PopStyleColor();
                     }
 #endif
@@ -2558,7 +3100,7 @@ namespace rs2
                         temp_cfg.set(configurations::performance::enable_msaa, msaa);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("MSAA will improve the rendering quality of edges at expense of greater GPU memory utilisation.");
+                        RsImGui::CustomTooltip("MSAA will improve the rendering quality of edges at expense of greater GPU memory utilisation.");
 
                     if (msaa)
                     {
@@ -2580,7 +3122,7 @@ namespace rs2
                         temp_cfg.set(configurations::performance::show_fps, show_fps);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Show application refresh rate in window title\nThis rate is unrelated to camera FPS and measures application responsivness");
+                        RsImGui::CustomTooltip("Show application refresh rate in window title\nThis rate is unrelated to camera FPS and measures application responsivness");
 
 
                     bool vsync = temp_cfg.get(configurations::performance::vsync);
@@ -2590,7 +3132,7 @@ namespace rs2
                         temp_cfg.set(configurations::performance::vsync, vsync);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Vertical sync will try to synchronize application framerate to the monitor refresh-rate (usually limiting the framerate to 60)");
+                        RsImGui::CustomTooltip("Vertical sync will try to synchronize application framerate to the monitor refresh-rate (usually limiting the framerate to 60)");
 
                     bool fullscreen = temp_cfg.get(configurations::window::is_fullscreen);
                     if (ImGui::Checkbox("Fullscreen (F8)", &fullscreen))
@@ -2605,7 +3147,7 @@ namespace rs2
                         temp_cfg.set(configurations::performance::show_skybox, show_skybox);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("When enabled, this option provides background to the 3D view, instead of leaving it blank.\nThis is purely cosmetic");
+                        RsImGui::CustomTooltip("When enabled, this option provides background to the 3D view, instead of leaving it blank.\nThis is purely cosmetic");
 
                     bool enable_occlusion_invalidation = temp_cfg.get(configurations::performance::occlusion_invalidation);
                     if (ImGui::Checkbox("Perform Occlusion Invalidation", &enable_occlusion_invalidation))
@@ -2613,7 +3155,7 @@ namespace rs2
                         temp_cfg.set(configurations::performance::occlusion_invalidation, enable_occlusion_invalidation);
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Occlusions are a natural side-effect of having multiple sensors\nWhen this option is enabled, the SDK will filter out occluded pixels");
+                        RsImGui::CustomTooltip("Occlusions are a natural side-effect of having multiple sensors\nWhen this option is enabled, the SDK will filter out occluded pixels");
                 }
 
                 if( tab == 2 )
@@ -2648,7 +3190,7 @@ namespace rs2
                         ImGui::PopStyleVar();
                         if( ImGui::IsItemHovered() )
                         {
-                            ImGui::SetTooltip( "%s", "--debug was specified; this cannot be applied without a restart" );
+                            RsImGui::CustomTooltip( "%s", "--debug was specified; this cannot be applied without a restart" );
                         }
                     }
                     bool log_to_file = temp_cfg.get(configurations::viewer::log_to_file);
@@ -2709,7 +3251,7 @@ namespace rs2
                     }
 
                     {
-                        ImGui::Text("HWLoggerEvents.xml Path:");
+                        ImGui::Text("FW logs XML file:");
                         ImGui::SameLine();
                         static char logpath[256];
                         memset(logpath, 0, 256);
@@ -2720,6 +3262,19 @@ namespace rs2
                         {
                             path_str = logpath;
                             temp_cfg.set(configurations::viewer::hwlogger_xml, path_str);
+                        }
+
+                        ImGui::SameLine();
+                        if( ImGui::Button( "FW logs XML" ) )
+                        {
+                            auto ret = file_dialog_open(open_file, "XML file\0*.xml\0", NULL, NULL);
+                            if( ret )
+                            {
+                                memset( logpath, 0, 256 );
+                                memcpy( logpath, ret, std::min( 255, static_cast< int >( strlen( ret ) ) ) );
+                                path_str = logpath;
+                                temp_cfg.set( configurations::viewer::hwlogger_xml, path_str );
+                            }
                         }
                     }
 
@@ -2763,27 +3318,57 @@ namespace rs2
                             catch (...){}
                         }
                     }
+
+                                        
+                    ImGui::Separator();
+                    ImGui::PopStyleColor();
+                    std::string excl_icon_str = rsutils::string::from() << textual_icons::exclamation_triangle
+                                                << " The following changes will take effect only after restarting the application";
+                    ImGui::Text( "%s", excl_icon_str.c_str() );
+                    bool allow_partial_device = temp_cfg.get_nested< bool >( "context.partial-device-allowed", true );
+                    if( ImGui::Checkbox( "Allow partial device initialization", &allow_partial_device ) )
+                    {
+                        temp_cfg.set_nested( "context.partial-device-allowed", allow_partial_device );
+                    }
+                    if (ImGui::IsItemHovered())
+                    {
+                        RsImGui::CustomTooltip( "%s", "In case of incomplete device initalization\n"
+                                                "allow a device with partial capabilities to be used" );
+                    }
+                    bool enable_dds = temp_cfg.get_nested<bool>("context.dds.enabled" , false);
+                    if( ImGui::Checkbox( "Enable DDS", &enable_dds ) )
+                    {
+                        temp_cfg.set_nested("context.dds.enabled", enable_dds);
+                    }
+                    if( enable_dds )
+                    {
+                        int domain_id = temp_cfg.get_nested< int >( "context.dds.domain", 0 );
+                        ImGui::SameLine();
+                        ImGui::SetCursorPosX( ImGui::GetCursorPosX() + 50 );
+                        ImGui::PushItemWidth( 150.0f );
+                        ImGui::Text( "Domain ID" );
+                        ImGui::SameLine();
+                        if( ImGui::InputInt( "##Domain ID", &domain_id ) )
+                        {
+                            if( domain_id < 0 )
+                                domain_id = 0;
+                            else if( domain_id > 232 )
+                                domain_id = 232;
+                            temp_cfg.set_nested("context.dds.domain", domain_id);
+                        }
+                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 0.8f));
                 }
 
                 if (tab == 3)
                 {
-                    bool recommend_fw_updates = temp_cfg.get(configurations::update::recommend_updates);
-                    if (ImGui::Checkbox("Recommend Bundled Firmware", &recommend_fw_updates))
-                    {
-                        temp_cfg.set(configurations::update::recommend_updates, recommend_fw_updates);
-                        refresh_updates = true;
-                    }
-                    if (ImGui::IsItemHovered())
-                    {
-                        ImGui::SetTooltip("%s", "When firmware of the device is below the version bundled with this software release\nsuggest firmware update");
-                    }
 #ifdef CHECK_FOR_UPDATES
                     ImGui::Separator();
 
                     ImGui::Text("%s", "SW/FW Updates From Server:");
                     if (ImGui::IsItemHovered())
                     {
-                        ImGui::SetTooltip("%s", "Select the server URL of the SW/FW updates information");
+                        RsImGui::CustomTooltip("%s", "Select the server URL of the SW/FW updates information");
                     }
                     ImGui::SameLine();
 
@@ -2810,7 +3395,7 @@ namespace rs2
                     }
                     if (ImGui::IsItemHovered())
                     {
-                        ImGui::SetTooltip("%s", "Add file:// prefix to use a local DB file ");
+                        RsImGui::CustomTooltip("%s", "Add file:// prefix to use a local DB file ");
                     }
 
                     if (!official_url)
@@ -2823,6 +3408,8 @@ namespace rs2
                     }
 #endif
                 }
+                }
+                ImGui::EndChild();
 
                 ImGui::Separator();
 
@@ -2833,18 +3420,20 @@ namespace rs2
                 if (reload_required)
                 {
                     ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
-                    ImGui::Text(u8"\uf071 The application will be restarted in order for new settings to take effect");
+                    std::string excl_icon_str = std::string(rsutils::string::from()
+                        << textual_icons::exclamation_triangle
+                        << " The application will be restarted in order for new settings to take effect");
+                    ImGui::Text("%s", excl_icon_str.c_str());
                     ImGui::PopStyleColor();
                 }
 
                 auto apply = [&](){
-                    config_file::instance() = temp_cfg;
                     window.on_reload_complete = [this](){
                         _skybox.reset();
                     };
                     if (reload_required) window.reload();
                     else if (refresh_required) window.refresh();
-                    update_configuration();
+                    update_configuration(&temp_cfg);
 
                     if (refresh_updates)
                         for (auto&& dev : devices)
@@ -2859,7 +3448,7 @@ namespace rs2
                 }
                 if (ImGui::IsItemHovered())
                 {
-                    ImGui::SetTooltip("%s", "Save settings and close");
+                    RsImGui::CustomTooltip("%s", "Save settings and close");
                 }
                 ImGui::SameLine();
 
@@ -2873,7 +3462,7 @@ namespace rs2
                 ImGui::PopStyleColor(2);
                 if (ImGui::IsItemHovered())
                 {
-                    ImGui::SetTooltip("%s", "Save settings");
+                    RsImGui::CustomTooltip("%s", "Save settings");
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Cancel", ImVec2(120, 0)))
@@ -2882,9 +3471,10 @@ namespace rs2
                 }
                 if (ImGui::IsItemHovered())
                 {
-                    ImGui::SetTooltip("%s", "Close window without saving any changes to the settings");
+                    RsImGui::CustomTooltip("%s", "Close window without saving any changes to the settings");
                 }
-
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar();
                 ImGui::EndPopup();
             }
 
@@ -2907,9 +3497,9 @@ namespace rs2
             ImGui::SetNextWindowSize({ w, h });
 
             flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar;
 
-            ImGui_ScopePushFont(window.get_font());
+            RsImGui_ScopePushFont(window.get_font());
             ImGui::PushStyleColor(ImGuiCol_PopupBg, sensor_bg);
             ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, white);
             ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
@@ -2918,25 +3508,31 @@ namespace rs2
 
             if (ImGui::BeginPopupModal(menu_items[3], nullptr, flags))
             {
+                // splash original width, height
+                auto width = 1920;
+                auto height = 1080;
+
+                // considering the pixels in which the Realsense logo is within splash image
+                ImVec2 uv0 = ImVec2(200.f / width, 300.f / height);
+                ImVec2 uv1 = ImVec2(1700.f / width, 600.f / height);
+
                 ImGui::Image((void*)(intptr_t)window.get_splash().get_gl_handle(),
-                             ImVec2(w - 30, 100), {0.20f, 0.38f}, {0.80f, 0.56f});
+                             ImVec2(w - 30, 100), uv0, uv1);
 
                 auto realsense_pos = ImGui::GetCursorPos();
-                ImGui::Text("Intel RealSense is a suite of depth-sensing and motion-tracking technologies.");
+                ImGui::Text("RealSense is a suite of depth-sensing and motion-tracking technologies.");
 
                 ImGui::Text("librealsense is an open-source cross-platform SDK for working with RealSense devices.");
 
                 ImGui::Text("Full source code is available at"); ImGui::SameLine();
                 auto github_pos = ImGui::GetCursorPos();
-                ImGui::Text("github.com/IntelRealSense/librealsense.");
+                ImGui::Text("github.com/realsenseai/librealsense.");
 
                 ImGui::Text("This software is distributed under the"); ImGui::SameLine();
                 auto license_pos = ImGui::GetCursorPos();
                 ImGui::Text("Apache License, Version 2.0.");
 
-                ImGui::Text("RealSense is a registered trademark of Intel Corporation.");
-
-                ImGui::Text("Copyright 2018 Intel Corporation.");
+                ImGui::Text("Copyright RealSense Inc 2018-2025.");
 
                 if( RS2_API_BUILD_VERSION )
                 {
@@ -2953,14 +3549,14 @@ namespace rs2
 
                 ImGui::SetCursorPos({ realsense_pos.x - 4, realsense_pos.y - 3 });
 
-                hyperlink(window, "Intel RealSense", "https://realsense.intel.com/");
+                hyperlink(window, "RealSense", "https://realsenseai.com/");
 
                 ImGui::SetCursorPos({ github_pos.x - 4, github_pos.y - 3 });
-                hyperlink(window, "github.com/IntelRealSense/librealsense", "https://github.com/IntelRealSense/librealsense/");
+                hyperlink(window, "github.com/realsenseai/librealsense", "https://github.com/realsenseai/librealsense/");
 
                 ImGui::SetCursorPos({ license_pos.x - 4, license_pos.y - 3 });
 
-                hyperlink(window, "Apache License, Version 2.0", "https://raw.githubusercontent.com/IntelRealSense/librealsense/master/LICENSE");
+                hyperlink(window, "Apache License, Version 2.0", "https://raw.githubusercontent.com/realsenseai/librealsense/master/LICENSE");
 
                 ImGui::PopStyleColor(4);
 
@@ -3020,22 +3616,22 @@ namespace rs2
         auto x_axis = cross(dir, up);
         auto step = sec_since_update * 0.3f;
 
-        if (ImGui::IsKeyPressed('w') || ImGui::IsKeyPressed('W'))
+        if (ImGui::GetIO().KeysDown[ImGuiKey_W])
         {
             pos = pos + dir * step;
             target = target + dir * step;
         }
-        if (ImGui::IsKeyPressed('s') || ImGui::IsKeyPressed('S'))
+        if (ImGui::GetIO().KeysDown[ImGuiKey_S])
         {
             pos = pos - dir * step;
             target = target - dir * step;
         }
-        if (ImGui::IsKeyPressed('d') || ImGui::IsKeyPressed('D'))
+        if (ImGui::GetIO().KeysDown[ImGuiKey_D])
         {
             pos = pos + x_axis * step;
             target = target + x_axis * step;
         }
-        if (ImGui::IsKeyPressed('a') || ImGui::IsKeyPressed('A'))
+        if (ImGui::GetIO().KeysDown[ImGuiKey_A])
         {
             pos = pos - x_axis * step;
             target = target - x_axis * step;
@@ -3052,7 +3648,7 @@ namespace rs2
             auto cy = mouse.cursor.y + overflow.y;
             auto py = mouse.prev_cursor.y + overflow.y;
 
-            auto dragging = ImGui::IsKeyDown(GLFW_KEY_LEFT_CONTROL);
+            auto dragging = ImGui::GetIO().KeysDown[GLFW_KEY_LEFT_CONTROL];
 
             // Limit how much user mouse can jump between frames
             // This can work poorly when the app FPS is really terrible (< 10)
@@ -3256,9 +3852,268 @@ namespace rs2
         else return nullptr;
     }
 
+    void viewer_model::get_frame_objects_container( rs2::frame & frame,
+                                                          std::shared_ptr< atomic_objects_in_frame > & objects )
+    {
+        auto uid = frame.get_profile().unique_id();
+        auto it = streams.find( uid );
+        if( it == streams.end() )
+        {
+            auto orig = streams_origin.find( uid );
+            if( orig != streams_origin.end() )
+                it = streams.find( orig->second );
+        }
+        if( it != streams.end() && it->second.dev )
+            objects = it->second.dev->detected_objects;
+    }
+
+    rs2::rect viewer_model::project_color_bbox_to_depth( const rs2::rect &     color_bbox,
+                                                         const uint16_t *      depth_data,
+                                                         float                 depth_scale,
+                                                         const rs2_intrinsics & depth_intrin,
+                                                         const rs2_intrinsics & color_intrin,
+                                                         const rs2_extrinsics & color_to_depth,
+                                                         const rs2_extrinsics & depth_to_color,
+                                                         const rs2::rect &     depth_frame_rect )
+    {
+        // Project both corners of the color bbox into depth-frame coordinates
+        float src_tl[2] = { color_bbox.x, color_bbox.y };
+        float src_br[2] = { color_bbox.x + color_bbox.w, color_bbox.y + color_bbox.h };
+        float dst_tl[2], dst_br[2];
+        rs2_project_color_pixel_to_depth_pixel( dst_tl, depth_data, depth_scale, 0.1f, 10.f,
+                                                &depth_intrin, &color_intrin, &color_to_depth, &depth_to_color, src_tl );
+        rs2_project_color_pixel_to_depth_pixel( dst_br, depth_data, depth_scale, 0.1f, 10.f,
+                                                &depth_intrin, &color_intrin, &color_to_depth, &depth_to_color, src_br );
+        return rs2::rect{ dst_tl[0], dst_tl[1], dst_br[0] - dst_tl[0], dst_br[1] - dst_tl[1] }.intersection( depth_frame_rect );
+    }
+
+    void viewer_model::process_object_detection_frames( std::map< int, rs2::frame > & last_frames )
+    {
+        // Scan last_frames for an object detection frame, a color frame, and a depth frame.
+        // These types have no default constructor; initialise from an empty rs2::frame.
+        rs2::object_detection_frame odf{ rs2::frame{} };
+        rs2::video_frame cf{ rs2::frame{} };
+        rs2::depth_frame df{ rs2::frame{} };
+        std::shared_ptr< atomic_objects_in_frame > objects;
+
+        for( auto & kv : last_frames )
+        {
+            rs2::frame & frame = kv.second;
+            if( ! frame )
+                continue;
+
+            auto stype = frame.get_profile().stream_type();
+
+            if( stype == RS2_STREAM_OBJECT_DETECTION && ! odf )
+            {
+                odf = frame.as< rs2::object_detection_frame >();
+            }
+            else if( stype == RS2_STREAM_COLOR && ! cf )
+            {
+                cf = frame.as< rs2::video_frame >();
+                get_frame_objects_container( frame, objects );
+            }
+            else if( stype == RS2_STREAM_DEPTH && ! df )
+            {
+                df = frame.as< rs2::depth_frame >();
+            }
+        }
+
+        // Without a color sensor we have nowhere to draw
+        if( ! objects )
+            return;
+
+        // No OD frame this tick. When OD fps < render fps this is normal (e.g. OD@15fps, RGB@30fps).
+        // Keep last known detections to avoid flicker, but clear if absent for too long (OD sensor stopped).
+        static constexpr int MAX_STALE_OD_TICKS = 3;
+        if( ! odf )
+        {
+            if( ++objects->ticks_without_od_frame > MAX_STALE_OD_TICKS )
+            {
+                std::lock_guard< std::mutex > lock( objects->mutex );
+                objects->clear();
+            }
+            return;
+        }
+        objects->ticks_without_od_frame = 0;
+
+        // OD frame arrived but depth not yet available — skip without clearing
+        if( ! df )
+            return;
+
+        // Fresh OD frame with no detections — clear
+        if( odf.get_detection_count() == 0 )
+        {
+            std::lock_guard< std::mutex > lock( objects->mutex );
+            objects->clear();
+            return;
+        }
+
+        try
+        {
+            auto color_vsp = cf.get_profile().as< rs2::video_stream_profile >();
+            auto depth_vsp = df.get_profile().as< rs2::video_stream_profile >();
+
+            rs2_intrinsics color_intrin = color_vsp.get_intrinsics();
+            rs2_intrinsics depth_intrin = depth_vsp.get_intrinsics();
+            rs2_extrinsics color_to_depth = color_vsp.get_extrinsics_to( depth_vsp );
+            rs2_extrinsics depth_to_color = depth_vsp.get_extrinsics_to( color_vsp );
+
+            rs2::rect color_frame_rect{ 0.f, 0.f, float( color_intrin.width ), float( color_intrin.height ) };
+            rs2::rect depth_frame_rect{ 0.f, 0.f, float( depth_intrin.width ), float( depth_intrin.height ) };
+
+            uint16_t const * const depth_data = reinterpret_cast< uint16_t const * >( df.get_data() );
+
+            com::depth_image_16 com_raw{ depth_data, depth_intrin.width, depth_intrin.height };
+            std::vector< uint8_t > depth8u_buf( depth_intrin.width * depth_intrin.height );
+            com::depth_image_8 com_depth8u{ depth8u_buf.data(), depth_intrin.width, depth_intrin.height };
+            bool depth8u_ready = false;
+
+            objects_in_frame new_objects;
+            unsigned int const count = odf.get_detection_count();
+
+            // Non-maximum suppression: sort by score, suppress overlapping same-class boxes
+            static constexpr float NMS_IOU_THRESHOLD   = 0.55f;
+            static constexpr int   NMS_SCORE_THRESHOLD = 45;
+            std::vector< rs2_object_detection > raw_dets( count );
+            for( unsigned int i = 0; i < count; ++i )
+                raw_dets[i] = odf.get_detection( i );
+            std::sort( raw_dets.begin(), raw_dets.end(),
+                []( const rs2_object_detection & a, const rs2_object_detection & b ) { return a.score > b.score; } );
+            std::vector< bool > suppressed( count, false );
+            for( size_t i = 0; i < count; ++i )
+                if( raw_dets[i].score < NMS_SCORE_THRESHOLD )
+                    suppressed[i] = true;
+            for( size_t i = 0; i < count; ++i )
+            {
+                if( suppressed[i] ) continue;
+                rs2::rect bi{ float( raw_dets[i].top_left_x ), float( raw_dets[i].top_left_y ),
+                              float( raw_dets[i].bottom_right_x - raw_dets[i].top_left_x ),
+                              float( raw_dets[i].bottom_right_y - raw_dets[i].top_left_y ) };
+                for( size_t j = i + 1; j < count; ++j )
+                {
+                    if( suppressed[j] || raw_dets[j].class_id != raw_dets[i].class_id ) continue;
+                    rs2::rect bj{ float( raw_dets[j].top_left_x ), float( raw_dets[j].top_left_y ),
+                                  float( raw_dets[j].bottom_right_x - raw_dets[j].top_left_x ),
+                                  float( raw_dets[j].bottom_right_y - raw_dets[j].top_left_y ) };
+                    float inter_area = bi.intersection( bj ).area();
+                    float union_area = bi.area() + bj.area() - inter_area;
+                    if( union_area > 0.f && inter_area / union_area > NMS_IOU_THRESHOLD )
+                        suppressed[j] = true;
+                }
+            }
+
+            size_t obj_id = 0;
+            for( size_t i = 0; i < count; ++i )
+            {
+                if( suppressed[i] ) continue;
+                rs2_object_detection const & det = raw_dets[i];
+
+                // Pixel-coordinate bounding box in the color frame
+                rs2::rect color_bbox{ float( det.top_left_x ),
+                                      float( det.top_left_y ),
+                                      float( det.bottom_right_x - det.top_left_x ),
+                                      float( det.bottom_right_y - det.top_left_y ) };
+                rs2::rect normalized_color_bbox = color_bbox.normalize( color_frame_rect );
+
+                // depth_bbox_full: simple resolution scaling of the color bbox.
+                // COM runs within this region for a stable, deterministic depth measurement.
+                // The depth-view dot position is corrected for sensor parallax separately
+                // by projecting the single COM pixel through rs2_project_color_pixel_to_depth_pixel.
+                float const depth_scale_x = float( depth_intrin.width  ) / float( color_intrin.width  );
+                float const depth_scale_y = float( depth_intrin.height ) / float( color_intrin.height );
+                // depth_bbox_full: unclipped scaled bbox — used for com_rel_u/v normalization.
+                // Clipping only affects the actual ROI sampled.
+                rs2::rect depth_bbox_full{
+                    color_bbox.x * depth_scale_x, color_bbox.y * depth_scale_y,
+                    color_bbox.w * depth_scale_x, color_bbox.h * depth_scale_y };
+                rs2::rect depth_bbox = depth_bbox_full.intersection( depth_frame_rect );
+                rs2::rect normalized_depth_bbox = depth_bbox.normalize( depth_frame_rect );
+
+                float const hkr_depth_m = det.depth;
+                float viewer_depth_m = 0.f;
+                float com_rel_u = 0.5f, com_rel_v = 0.5f;
+
+                // TODO: temporary fallback — viewer-side COM runs only when HKR firmware
+                // returns 0 (XU command not supported or device not ready).
+                // Checked per-detection intentionally: firmware could return 0 for individual
+                // detections (e.g. out-of-range) even when HKR COM is otherwise working.
+                // Remove once HKR COM is fully implemented and reliable on all devices.
+                if( hkr_depth_m == 0.f )
+                {
+                    if( !depth8u_ready )
+                    {
+                        com::center_of_mass_calculator::create_depth_8u( com_raw, com_depth8u );
+                        depth8u_ready = true;
+                    }
+                    int const com_x = (int)depth_bbox.x;
+                    int const com_y = (int)depth_bbox.y;
+                    com::rect  com_bbox{ com_x, com_y,
+                                         (int)( depth_bbox.x + depth_bbox.w + 0.5f ) - com_x,
+                                         (int)( depth_bbox.y + depth_bbox.h + 0.5f ) - com_y };
+                    com::vec2f com_center{ depth_bbox.x + depth_bbox.w * 0.5f,
+                                           depth_bbox.y + depth_bbox.h * 0.5f };
+                    com::camera_intrinsics com_intrin{ depth_intrin.fx, depth_intrin.fy,
+                                                       depth_intrin.ppx, depth_intrin.ppy };
+                    // Project bbox center from color space to raw-depth space to get
+                    // the stereo-baseline pixel shift; keep {0,0} if no depth at bbox center.
+                    float shift_x = 0.f, shift_y = 0.f;
+                    float center_px[2] = { color_bbox.x + color_bbox.w * 0.5f,
+                                           color_bbox.y + color_bbox.h * 0.5f };
+                    float const depth_units = df.get_units();
+                    float depth_px[2]  = { -1.f, -1.f };
+                    rs2_project_color_pixel_to_depth_pixel( depth_px, depth_data, depth_units, 0.1f, 10.f,
+                        &depth_intrin, &color_intrin, &color_to_depth, &depth_to_color, center_px );
+                    if( depth_px[0] >= 0.f && depth_px[0] < float( depth_intrin.width ) &&
+                        depth_px[1] >= 0.f && depth_px[1] < float( depth_intrin.height ) )
+                    {
+                        uint16_t center_raw = depth_data[(int)depth_px[1] * depth_intrin.width + (int)depth_px[0]];
+                        float const center_m = center_raw * depth_units;
+                        if( center_m > 0.4f && center_m < 8.0f )
+                        {
+                            shift_x = depth_px[0] - center_px[0] * depth_scale_x;
+                            shift_y = depth_px[1] - center_px[1] * depth_scale_y;
+                        }
+                    }
+                    com::person_center_of_mass com_result{};
+                    com::center_of_mass_calculator::calculate( com_raw, com_depth8u, com_bbox, com_center,
+                                                               &com_intrin, com_result, { shift_x, shift_y } );
+                    if( com_result.mean_body_depth > 0.f )
+                    {
+                        viewer_depth_m = com_result.mean_body_depth / 1000.f;
+                        auto clamp01 = []( float v ) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
+                        if( depth_bbox_full.w > 0.f && depth_bbox_full.h > 0.f )
+                        {
+                            com_rel_u = clamp01( ( com_result.image_pos.x - depth_bbox_full.x ) / depth_bbox_full.w );
+                            com_rel_v = clamp01( ( com_result.image_pos.y - depth_bbox_full.y ) / depth_bbox_full.h );
+                        }
+                    }
+                }
+
+                float const mean_depth = hkr_depth_m > 0.f ? hkr_depth_m : viewer_depth_m;
+
+                std::string name = object_type_to_string( static_cast< object_type >( det.class_id ) );
+                new_objects.emplace_back( obj_id++, name, normalized_color_bbox, normalized_depth_bbox, mean_depth,
+                                          hkr_depth_m, com_rel_u, com_rel_v, det.score,
+                                          static_cast< object_type >( det.class_id ) );
+            }
+
+            std::lock_guard< std::mutex > lock( objects->mutex );
+            if( objects->sensor_is_on )
+                objects->swap( new_objects );
+            else
+                objects->clear();
+        }
+        catch( std::exception const & e )
+        {
+            LOG_WARNING( "Object detection processing: " << e.what() );
+        }
+    }
+
+
     void viewer_model::draw_viewport(const rect& viewer_rect,
         ux_window& window, int devices, std::string& error_message,
-        std::shared_ptr<texture_buffer> texture, points points)
+        std::shared_ptr<texture_buffer> texture, points points, labeled_points labeled_points)
     {
         if (!modal_notification_on)
             updates->draw(not_model, window, error_message);
@@ -3291,7 +4146,7 @@ namespace rs2
             rect fb_size{ 0, 0, (float)window.framebuf_width(), (float)window.framebuf_height() };
             rect new_rect = viewer_rect.normalize(window_size).unnormalize(fb_size);
 
-            render_3d_view(new_rect, window, texture, points);
+            render_3d_view(new_rect, window, texture, points, labeled_points);
 
             auto rect_copy = viewer_rect;
             rect_copy.y += 60;
@@ -3301,7 +4156,7 @@ namespace rs2
                 _measurements.show_tooltip(window);
         }
 
-        if (ImGui::IsKeyPressed(' '))
+        if (ImGui::IsKeyPressed(ImGuiKey_Space))
         {
             if (paused)
             {
@@ -3401,4 +4256,213 @@ namespace rs2
             }
         }
     }
+
+    void viewer_model::init_labeled_points_uid()
+    {
+        for (auto&& s : streams)
+        {
+            if (s.second.is_stream_visible() &&
+                s.second.profile.stream_type() == RS2_STREAM_LABELED_POINT_CLOUD)
+            {
+                auto stream_origin_iter = streams_origin.find(s.second.profile.unique_id());
+                if (stream_origin_iter != streams_origin.end() &&
+                    streams.find(stream_origin_iter->second) != streams.end() &&
+                    selected_labeled_points_source_uid != stream_origin_iter->second)
+                {
+                    selected_labeled_points_source_uid = stream_origin_iter->second;
+                }
+            }
+        }
+    }
+
+    void viewer_model::draw_zone_3d(Zone zone, const rs2::labeled_points& frame)
+    {
+        glLineWidth(4.0f);
+        glBegin(GL_LINE_LOOP);
+
+        const auto MM_TO_METER_SCALE = 0.001f; // coords are in mm, converts to meters
+        auto zone_to_draw = init_zone(zone, frame, MM_TO_METER_SCALE); 
+        set_polygon_color(zone);
+
+        for (vertex& v : zone_to_draw)
+        {
+            // we transform LPC to depth - z=0 in LPC will be transformed to depth sensor (=camera) height
+            // - drawn after the matrix rotation & translation
+            glVertex3f(v.x, v.y, 0); 
+        }
+
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
+    void viewer_model::draw_3d_labeled_points(const rect& viewer_rect, rs2::labeled_points labeled_points)
+    {
+        auto labeled_points_profile = last_labeled_points.get_profile().as<video_stream_profile>();
+        // Non-linear correspondence customized for non-flat surface exploration
+        if (labeled_points_profile.width() <= 0)
+            throw std::runtime_error("Profile width must be greater than 0.");
+
+        float point_size = std::sqrt(viewer_rect.w / labeled_points_profile.width());
+        if (selected_lpc_points_size == lpc_points_size::lpc_medium)
+            point_size *= 3.f;
+        else if (selected_lpc_points_size == lpc_points_size::lpc_large)
+            point_size *= 5.f;
+        glPointSize(point_size);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, texture_border_mode);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, texture_border_mode);
+        
+        auto& lpc_stream_model = streams.at(labeled_points_profile.unique_id());
+        
+        rs2_extrinsics lpc_to_depth = lpc_stream_model.dev->get_extrinsics_from_depth();
+        auto rot = lpc_to_depth.rotation;
+        GLfloat rotation_matrix[16] = { rot[0], rot[3], rot[6], 0,
+                                        rot[1], rot[4], rot[7], 0,
+                                        rot[2], rot[5], rot[8], 0,
+                                         0    ,   0,      0,    1 };
+        glMultMatrixf(rotation_matrix);
+
+        // getting inverse of the translation, in depth coordinates, as this is the one needed by OpenGL
+        glTranslatef(-lpc_to_depth.translation[0], -lpc_to_depth.translation[1], -lpc_to_depth.translation[2]);
+        
+        if (show_safety_zones_3d)
+        {
+            draw_zone_3d(Zone::Danger, labeled_points);
+            draw_zone_3d(Zone::Warning, labeled_points);
+            draw_zone_3d(Zone::Diagnostic, labeled_points);
+        }
+
+        glBegin(GL_POINTS);
+        {
+            auto vertices = last_labeled_points.get_vertices();
+            auto vertices_size = last_labeled_points.size();
+            auto labels = last_labeled_points.get_labels();
+            auto label_to_color3f = labeled_point_cloud_utilities::get_label_to_color3f();
+
+            /* this segment actually renders the labeled pointcloud */
+            for (int i = 0; i < vertices_size; ++i)
+            {
+                // Set the vertex color from the label value
+                auto label = labels[i];
+                auto color = label_to_color3f[static_cast<rs2_point_cloud_label>(label)];
+                glColor3f(color.x, color.y, color.z);
+
+                // Draw the vertex
+                rs2::vertex vtx = { vertices[i].x, vertices[i].y, vertices[i].z };
+                glVertex3fv(std::move(vtx));
+            }
+        }
+        glEnd();
+
+        glColor4f(1.f, 1.f, 1.f, 1.f);
+
+        check_gl_error();
+    }
+
+    bool viewer_model::should_texture_frame_be_updated(const rs2::frame& f) const
+    {
+        return (f.get_profile().stream_type() != RS2_STREAM_LABELED_POINT_CLOUD &&
+            ((selected_tex_source_uid == -1 && f.get_profile().format() == RS2_FORMAT_Z16)
+                || (f.get_profile().format() != RS2_FORMAT_ANY && is_3d_texture_source(f))));
+    }
+
+    void viewer_model::set_polygon_color(Zone zone)
+    {
+        switch (zone)
+        {
+        case Zone::Danger:
+            glColor3f(red.x, red.y, red.z);
+            break;
+        case Zone::Warning:
+            glColor3f(yellow.x, yellow.y, yellow.z);
+            break;
+        case Zone::Diagnostic:
+            glColor3f(regular_blue.x, regular_blue.y, regular_blue.z);
+            break;
+        default:
+            LOG_ERROR("Invalid zone, got: " << static_cast<int>(zone));
+            return;
+        }
+    }
+
+    std::vector<vertex> viewer_model::init_zone(Zone zone, const frame& frame, float scale_factor)
+    {
+        std::vector<vertex> points;
+        rs2_frame_metadata_value md_value;
+        switch (zone)
+        {
+        case Zone::Danger:
+            md_value = RS2_FRAME_METADATA_DANGER_ZONE_POINT_0_X_CORD;
+            break;
+        case Zone::Warning:
+            md_value = RS2_FRAME_METADATA_WARNING_ZONE_POINT_0_X_CORD;
+            break;
+        case Zone::Diagnostic:
+            md_value = RS2_FRAME_METADATA_DIAGNOSTIC_ZONE_POINT_0_X_CORD;
+            break;
+        default:
+            LOG_ERROR("Invalid zone, got: " << static_cast<int>(zone));
+            return points;
+        }
+
+        // assuming all md values are subsequent 
+        vertex x0 = { static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value))) * scale_factor,
+                        static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 1))) * scale_factor, 0 };
+        vertex x1 = { static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 2))) * scale_factor,
+                        static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 3))) * scale_factor, 0 };
+        vertex x2 = { static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 4))) * scale_factor,
+                        static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 5))) * scale_factor, 0 };
+        vertex x3 = { static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 6))) * scale_factor,
+                        static_cast<float>(frame.get_frame_metadata(static_cast<rs2_frame_metadata_value>(md_value + 7))) * scale_factor, 0 };
+        points = { x0, x1, x2, x3 };
+        return points;
+    }
+
+    // get a vertex in LPC corrdinates, and transform to openGL corrdinates
+    // we can't use the rotation matrix (from the extrinsics) here as this is only a transformation in 2D and not in 3D
+    // the transformation we need is expected to stay the same - mirror the values on X and Y axis
+    vertex viewer_model::transform_vertex(vertex v, const rect& normalize_from, const rect& unnormalize_to)
+    {
+        vertex v2 = { 0,0,0 };
+
+        // normalize each value between 0 and 1, v is expected to be within normalize_from
+        // note v.y -> v2.x and v.x -> v2.y, this is a part of the transformation
+        v2.x = (v.y - normalize_from.x) / normalize_from.w;
+        v2.y = (v.x - normalize_from.y) / normalize_from.h;
+
+        // since x and y are normalized to be between 0 and 1, we can use this to mirror them
+        v2.x = 1 - v2.x;
+        v2.y = 1 - v2.y;
+
+        // 'unnormalize' the values back, so they fit in the wanted frame, unnormalize_to
+        v2.x = v2.x * unnormalize_to.w + unnormalize_to.x;
+        v2.y = v2.y * unnormalize_to.h + unnormalize_to.y;
+
+        return v2;
+    }
+
+
+    void viewer_model::draw_zone_2d(Zone zone, const rect& draw_within, const frame& frame)
+    {
+        glLineWidth(3.0f);
+        glBegin(GL_LINE_LOOP);
+
+        auto MM_TO_CM_SCALE = 0.1f;  // coords are in mm, converts to cm
+        auto zone_to_draw = init_zone(zone, frame, MM_TO_CM_SCALE);
+        set_polygon_color(zone);
+
+        constexpr GLfloat width = 512; // range of Y values for polygons - -2.56 - +2.56 meters
+        constexpr GLfloat height = 640; // range of X values for polygons - 0-6.4 meters
+        rect safety_regions_rect = { -256, 0, width, height };  //-256 is the minimum Y value, 0 is the minimum X value, all zones are within this area
+        for (vertex& v : zone_to_draw)
+        {
+            auto vertex = transform_vertex(v, safety_regions_rect, draw_within);
+            glVertex2f(vertex.x, vertex.y);
+        }
+
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
+        
 }

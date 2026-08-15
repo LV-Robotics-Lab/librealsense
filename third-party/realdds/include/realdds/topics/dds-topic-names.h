@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2024 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2024 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include <string>
@@ -24,6 +24,29 @@ constexpr char const * NOTIFICATION_TOPIC_NAME = "/notification";
 constexpr char const * CONTROL_TOPIC_NAME = "/control";
 constexpr char const * METADATA_TOPIC_NAME = "/metadata";
 constexpr char const * DFU_TOPIC_NAME = "/dfu";
+
+
+namespace ros2 {
+
+constexpr char const * NAMESPACE = "/realsense";  // must begin with /
+
+constexpr char const * ROOT = "rt/";
+constexpr size_t ROOT_LEN = 3;
+constexpr char const * SERVICE_REQUEST_ROOT = "rq/";
+constexpr char const * SERVICE_RESPONSE_ROOT = "rr/";
+
+constexpr char const * GET_PARAMETERS_NAME = "/get_parameters";
+constexpr char const * SET_PARAMETERS_NAME = "/set_parameters";
+constexpr char const * LIST_PARAMETERS_NAME = "/list_parameters";
+constexpr char const * DESCRIBE_PARAMETERS_NAME = "/describe_parameters";
+
+constexpr char const * REQUEST_SUFFIX = "Request";
+constexpr char const * RESPONSE_SUFFIX = "Reply";
+
+constexpr char const * DISCOVERY_INFO = "ros_discovery_info";
+constexpr char const * PARAMETER_EVENTS_NAME = "parameter_events";
+
+}  // namespace ros2
 
 
 namespace notification {
@@ -60,12 +83,19 @@ namespace notification {
             extern std::string const stream_name;
             extern std::string const options;
             extern std::string const intrinsics;
-            extern std::string const recommended_filters;
+            extern std::string const embedded_filters;
         }
         namespace intrinsics {
             namespace key {
                 extern std::string const accel;
                 extern std::string const gyro;
+                extern std::string const width;
+                extern std::string const height;
+                extern std::string const principal_point;
+                extern std::string const focal_length;
+                extern std::string const model;
+                extern std::string const coefficients;
+                extern std::string const force_symmetry;
             }
         }
     }
@@ -90,6 +120,15 @@ namespace notification {
         extern std::string const id;
         namespace key {
             extern std::string const progress;
+        }
+    }
+    namespace calibration_changed {
+        extern std::string const id;
+        namespace key {
+            using stream_options::key::intrinsics;
+        }
+        namespace intrinsics {
+            using namespace stream_options::intrinsics;
         }
     }
 }
@@ -146,11 +185,33 @@ namespace control {
     }
     namespace dfu_start {
         extern std::string const id;
+        namespace key {
+            extern std::string const crc;
+            extern std::string const size;
+        }
     }
     namespace dfu_apply {
         using notification::dfu_apply::id;
         namespace key {
             extern std::string const cancel;
+        }
+    }
+
+    namespace set_filter {
+        extern std::string const id;
+        namespace key {
+            extern std::string const name;
+            extern std::string const options;
+            extern std::string const stream_name;
+        }
+    }
+
+    namespace query_filter {
+        extern std::string const id;
+        namespace key {
+            using control::set_filter::key::name;
+            using control::set_filter::key::options;
+            using control::set_filter::key::stream_name;
         }
     }
 }
@@ -204,6 +265,22 @@ namespace reply {
     namespace dfu_apply {
         using control::dfu_apply::id;
         namespace key {
+        }
+    }
+    namespace set_filter {
+        using control::set_filter::id;
+        namespace key {
+            using control::set_filter::key::name;
+            using control::set_filter::key::options;
+            using control::set_filter::key::stream_name;
+        }
+    }
+    namespace query_filter {
+        using control::query_filter::id;
+        namespace key {
+            using control::set_filter::key::name;
+            using control::set_filter::key::options;
+            using control::set_filter::key::stream_name;
         }
     }
 }
