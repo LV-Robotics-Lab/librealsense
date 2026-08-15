@@ -16,7 +16,11 @@ function(get_fastdds)
     FetchContent_Declare(
       fastdds
       GIT_REPOSITORY https://github.com/eProsima/Fast-DDS.git
-      GIT_TAG        v2.11.2
+      # 2.10.x is eProsima's last LTS version that still supports U20
+      # 2.10.4 has specific modifications based on support provided, but it has some incompatibility
+      # with the way we clone (which works with v2.11+), so they made a fix and tagged it for us:
+      # Once they have 2.10.5 we should move to it
+      GIT_TAG        v2.10.4-realsense
       GIT_SUBMODULES ""     # Submodules will be cloned as part of the FastDDS cmake configure stage
       GIT_SHALLOW ON        # No history needed
       SOURCE_DIR ${CMAKE_BINARY_DIR}/third-party/fastdds
@@ -33,6 +37,8 @@ function(get_fastdds)
     set(SQLITE3_SUPPORT OFF CACHE INTERNAL "" FORCE)
     #set(ENABLE_OLD_LOG_MACROS OFF CACHE INTERNAL "" FORCE)  doesn't work
     set(FASTDDS_STATISTICS OFF CACHE INTERNAL "" FORCE)
+    # Enforce NO_TLS to disable SSL: if OpenSSL is found, it will be linked to, and we don't want it!
+    set(NO_TLS ON CACHE INTERNAL "" FORCE)
 
     # Set special values for FastDDS sub directory
     set(BUILD_SHARED_LIBS OFF)
@@ -54,14 +60,35 @@ function(get_fastdds)
 
     add_library(dds INTERFACE)
     target_link_libraries( dds INTERFACE fastcdr fastrtps )
+    
+    disable_third_party_warnings(fastcdr)  
+    disable_third_party_warnings(fastrtps)  
 
     add_definitions(-DBUILD_WITH_DDS)
 
-    install(TARGETS dds EXPORT realsense2Targets)
+    install(TARGETS dds fastrtps eProsima_atomic EXPORT realsense2Targets)
+    
+    # fastcdr is installed separately because it cannot be exported to realsense2Targets - it is already exported in fastdds
+    # install in order to set ARCHIVE DESTINATION - to put libfastcdr.a into the x86_64 folder
+    install(TARGETS fastcdr 
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
     message(CHECK_PASS "Done")
 endfunction()
+
+
+pop_security_flags()
 
 # Trigger the FastDDS build
 get_fastdds()
 
+if(BUILD_WITH_DDS)
+   set(REALSENSE2_DDS_DEPENDENCIES
+   	 "include(CMakeFindDependencyMacro)\n
+	  find_dependency(fastcdr CONFIG REQUIRED)\n
+	  find_dependency(foonathan_memory CONFIG REQUIRED)\n"
+	  )
+else()
+  set(REALSENSE2_DDS_DEPENDENCIES "")
+endif()
 
+push_security_flags()

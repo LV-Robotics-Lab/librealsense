@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2015 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include <src/source.h>
 
@@ -9,6 +9,7 @@
 
 #include <rsutils/string/from.h>
 #include <src/core/stream-profile-interface.h>
+#include <src/object-detection-frame.h>
 
 namespace librealsense
 {
@@ -62,7 +63,10 @@ namespace librealsense
                                   RS2_EXTENSION_DEPTH_FRAME,
                                   RS2_EXTENSION_DISPARITY_FRAME,
                                   RS2_EXTENSION_MOTION_FRAME,
-                                  RS2_EXTENSION_POSE_FRAME };
+                                  RS2_EXTENSION_POSE_FRAME,
+                                  RS2_EXTENSION_LABELED_POINTS,
+                                  RS2_EXTENSION_INFERENCE_FRAME,
+                                  RS2_EXTENSION_OBJECT_DETECTION_FRAME };
 
         _metadata_parsers = metadata_parsers;
     }
@@ -196,7 +200,13 @@ namespace librealsense
             return RS2_EXTENSION_DEPTH_FRAME;
         case RS2_STREAM_ACCEL:
         case RS2_STREAM_GYRO:
+        case RS2_STREAM_MOTION:
             return RS2_EXTENSION_MOTION_FRAME;
+        case RS2_STREAM_LABELED_POINT_CLOUD:
+            return RS2_EXTENSION_LABELED_POINTS;
+
+        case RS2_STREAM_OBJECT_DETECTION:
+            return RS2_EXTENSION_OBJECT_DETECTION_FRAME;
 
         case RS2_STREAM_COLOR:
         case RS2_STREAM_INFRARED:
@@ -204,6 +214,8 @@ namespace librealsense
         case RS2_STREAM_GPIO:
         case RS2_STREAM_POSE:
         case RS2_STREAM_CONFIDENCE:
+        case RS2_STREAM_SAFETY:
+        case RS2_STREAM_OCCUPANCY:
             return RS2_EXTENSION_VIDEO_FRAME;
 
         default:

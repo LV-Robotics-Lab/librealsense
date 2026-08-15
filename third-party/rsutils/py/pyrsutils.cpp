@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 
 #include <rsutils/py/pybind11.h>
 #include <rsutils/easylogging/easyloggingpp.h>
@@ -9,8 +9,13 @@
 #include <rsutils/version.h>
 #include <rsutils/number/running-average.h>
 #include <rsutils/number/stabilized-value.h>
+#include <rsutils/time/stopwatch.h>
+#include <rsutils/time/timer.h>
+#include <rsutils/time/periodic-timer.h>
 #include <rsutils/os/executable-name.h>
 #include <rsutils/os/special-folder.h>
+#include <rsutils/type/eth-config.h>
+#include <rsutils/type/ip-address.h>
 
 
 #define NAME pyrsutils
@@ -44,6 +49,18 @@ PYBIND11_MODULE(NAME, m) {
         { return rsutils::string::shorten_json_string( j.dump(), max_length ).to_string(); },
         py::arg( "json" ),
         py::arg( "max-length" ) = 96 );
+    m.def(
+        "json_dump",  // pretty print, using our own output
+        []( rsutils::json const & j, size_t indent )
+        {
+            std::ostringstream os;
+            if( indent )
+                os << std::setw( indent );
+            os << j;
+            return os.str();
+        },
+        py::arg( "json" ),
+        py::arg( "indent" ) = 4 );
     m.def( "executable_path", &rsutils::os::executable_path );
     m.def( "executable_name", &rsutils::os::executable_name, py::arg( "with_extension" ) = false );
 
@@ -124,24 +141,43 @@ PYBIND11_MODULE(NAME, m) {
               } )
         .def( "add", &double_avg::add );
 
-    using stabilized_value = rsutils::number::stabilized_value< double >;
-    auto not_empty = []( stabilized_value const & self ) {
-        return ! self.empty();
+    // Helpers to bridge std::chrono <-> python float seconds
+    auto to_seconds = []( rsutils::time::clock::duration d ) -> double
+    {
+        return std::chrono::duration< double >( d ).count();
     };
-    auto to_string = []( stabilized_value const & self ) -> std::string {
-        if( self.empty() )
-            return "EMPTY";
-        return rsutils::string::from( self.get() );
+    auto from_seconds = []( double s ) -> rsutils::time::clock::duration
+    {
+        return std::chrono::duration_cast< rsutils::time::clock::duration >( std::chrono::duration< double >( s ) );
     };
-    py::class_< stabilized_value >( m, "stabilized_value" )
-        .def( py::init< size_t >() )
-        .def( "empty", &stabilized_value::empty )
-        .def( "__bool__", not_empty )
-        .def( "add", &stabilized_value::add )
-        .def( "get", &stabilized_value::get, py::arg( "stabilization-percent" ) = 0.75 )
-        .def( "clear", &stabilized_value::clear )
-        .def( "to_string", to_string )
-        .def( "__str__", to_string );
+
+    using rsutils::time::stopwatch;
+    py::class_< stopwatch >( m, "stopwatch" )
+        .def( py::init<>() )
+        .def( "reset", []( stopwatch & self ) { self.reset(); } )
+        .def( "get_start",
+              [to_seconds]( stopwatch const & self ) { return to_seconds( self.get_start().time_since_epoch() ); } )
+        .def( "get_elapsed", [to_seconds]( stopwatch const & self ) { return to_seconds( self.get_elapsed() ); } )
+        .def( "get_elapsed_ms", &stopwatch::get_elapsed_ms );
+
+    using rsutils::time::timer;
+    py::class_< timer >( m, "timer" )
+        .def( py::init( [from_seconds]( double timeout ) { return std::make_unique< timer >( from_seconds( timeout ) ); } ),
+              py::arg( "timeout" ) )
+        .def( "start", &timer::start )
+        .def( "reset",
+              [from_seconds]( timer & self, double new_timeout ) { self.reset( from_seconds( new_timeout ) ); },
+              py::arg( "timeout" ) )
+        .def( "has_expired", &timer::has_expired )
+        .def( "set_expired", &timer::set_expired )
+        .def( "time_left", [to_seconds]( timer const & self ) { return to_seconds( self.time_left() ); } );
+
+    using rsutils::time::periodic_timer;
+    py::class_< periodic_timer >( m, "periodic_timer" )
+        .def( py::init( [from_seconds]( double delta ) { return std::make_unique< periodic_timer >( from_seconds( delta ) ); } ),
+              py::arg( "delta" ) )
+        .def( "__bool__", []( periodic_timer const & self ) { return static_cast< bool >( self ); } )
+        .def( "set_expired", &periodic_timer::set_expired );
 
     py::enum_< rsutils::os::special_folder >( m, "special_folder" )
         .value( "app_data", rsutils::os::special_folder::app_data )
@@ -151,4 +187,73 @@ PYBIND11_MODULE(NAME, m) {
         .value( "user_pictures", rsutils::os::special_folder::user_pictures )
         .value( "user_videos", rsutils::os::special_folder::user_videos );
     m.def( "get_special_folder", rsutils::os::get_special_folder );
+
+    using rsutils::type::ip_address;
+    py::class_< ip_address >( m, "ip_address" )
+        .def( py::init<>() )
+        .def( py::init< uint8_t, uint8_t, uint8_t, uint8_t >(), "b1", "b2", "b3", "b4" )
+        .def( py::init< const uint8_t* >(), "b" )
+        .def( "is_valid", &ip_address::is_valid )
+        .def( "empty", &ip_address::empty )
+        .def( "clear", &ip_address::clear )
+        .def( "__str__", &ip_address::to_string )
+        .def( "__eq__", &ip_address::operator== )
+        .def( "__ne__", &ip_address::operator!= )
+        .def( "get_components", []( const ip_address & self, uint8_t & b0, uint8_t & b1, uint8_t & b2, uint8_t & b3 ) { self.get_components( b0, b1, b2, b3 ); }, "Get IP address components" )
+        .def( "get_components", []( const ip_address & self, uint8_t b[4] ) { self.get_components( b ); }, "Get IP address components" );
+
+    using rsutils::type::ip_3;
+    py::class_< ip_3 >( m, "ip_3" )
+        .def( py::init<>() )
+        .def_readwrite( "ip", &ip_3::ip )
+        .def_readwrite( "netmask", &ip_3::netmask )
+        .def_readwrite( "gateway", &ip_3::gateway );
+
+    using rsutils::type::eth_config_header;
+    py::class_< eth_config_header >( m, "eth_config_header" )
+        .def( py::init<>() )
+        .def_readwrite( "version", &eth_config_header::version )
+        .def_readwrite( "size", &eth_config_header::size )
+        .def_readwrite( "crc", &eth_config_header::crc );
+
+    using rsutils::type::link_priority;
+    py::enum_< link_priority >( m, "link_priority" )
+        .value( "usb_only", link_priority::usb_only )
+        .value( "eth_only", link_priority::eth_only )
+        .value( "eth_first", link_priority::eth_first )
+        .value( "usb_first", link_priority::usb_first )
+        .value( "dynamic_eth_first", link_priority::dynamic_eth_first )
+        .value( "dynamic_usb_first", link_priority::dynamic_usb_first );
+
+    using rsutils::type::eth_config;
+    py::class_< eth_config::dds_t >( m, "eth_config::dds_t" )
+        .def( py::init<>() )
+        .def_readwrite( "domain_id", &eth_config::dds_t::domain_id );
+
+    py::class_< eth_config::link_t >( m, "eth_config::link_t" )
+        .def( py::init<>() )
+        .def_readwrite( "mtu", &eth_config::link_t::mtu )
+        .def_readwrite( "speed", &eth_config::link_t::speed )
+        .def_readwrite( "timeout", &eth_config::link_t::timeout )
+        .def_readwrite( "priority", &eth_config::link_t::priority );
+
+    py::class_< eth_config::dhcp_t >( m, "eth_config::dhcp_t" )
+        .def( py::init<>() )
+        .def_readwrite( "on", &eth_config::dhcp_t::on )
+        .def_readwrite( "timeout", &eth_config::dhcp_t::timeout );
+
+    py::class_< eth_config >( m, "eth_config" )
+        .def( py::init<>() )
+        .def( py::init< std::vector< uint8_t > const & >() )
+        .def_readwrite( "header", &eth_config::header )
+        .def_readwrite( "mac_address", &eth_config::mac_address )
+        .def_readwrite( "configured", &eth_config::configured )
+        .def_readwrite( "actual", &eth_config::actual )
+        .def_readwrite( "dds", &eth_config::dds )
+        .def_readwrite( "link", &eth_config::link )
+        .def_readwrite( "dhcp", &eth_config::dhcp )
+        .def_readwrite( "transmission_delay", &eth_config::transmission_delay )
+        .def_readwrite( "udp_ttl", &eth_config::udp_ttl )
+        .def( "build_command", &eth_config::build_command )
+        .def( "validate", &eth_config::validate );
 }

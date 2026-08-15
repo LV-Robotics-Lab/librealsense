@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -9,7 +9,10 @@
 #include "ux-window.h"
 
 #include <imgui.h>
+#include <implot.h>
 #include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+#include <realsense_imgui.h>
 
 #include "device-model.h"
 
@@ -53,9 +56,7 @@ namespace rs2
 
     void prepare_config_file()
     {
-        config_file::instance().set_default(configurations::update::allow_rc_firmware, false);
         config_file::instance().set_default(configurations::update::recommend_calibration, true);
-        config_file::instance().set_default(configurations::update::recommend_updates, true);
         config_file::instance().set_default(configurations::update::sw_updates_url, server_versions_db_url);
         config_file::instance().set_default(configurations::update::sw_updates_official_server, true);
 
@@ -100,6 +101,9 @@ namespace rs2
         config_file::instance().set_default(configurations::viewer::log_filename, path + "librealsense.log");
         config_file::instance().set_default(configurations::record::default_path, path);
 
+        config_file::instance().set_nested_default(configurations::dds::enable_dds, false);
+        config_file::instance().set_nested_default(configurations::dds::domain_id, 0);
+        
 #ifdef __APPLE__
 
         config_file::instance().set_default(configurations::performance::font_oversample, 2);
@@ -153,6 +157,10 @@ namespace rs2
             config_file::instance().set_default(configurations::viewer::shading_mode, 0);
         }
 #endif
+
+        // Since we have seen on several laptops models that using GLSL for processing cause a memory leak decided to disable it by default
+        // Users can still enable it if they wish
+        config_file::instance().set_default(configurations::performance::glsl_for_processing, false);
     }
 
     void ux_window::reload()
@@ -221,7 +229,8 @@ namespace rs2
             if (_use_glsl_proc) rs2::gl::shutdown_processing();
 
             ImGui::GetIO().Fonts->ClearFonts();  // To be refactored into Viewer theme object
-            ImGui_ImplGlfw_Shutdown();
+            ImPlot::DestroyContext();
+            RsImGui::PopNewFrame();
             glfwDestroyWindow(_win);
             glfwDestroyCursor(_hand_cursor);
             glfwDestroyCursor(_cross_cursor);
@@ -270,8 +279,8 @@ namespace rs2
 
         _fullscreen = config_file::instance().get(configurations::window::is_fullscreen);
 
-        rs2_error* e = nullptr;
-        _title_str = rsutils::string::from() << _title << " v" << api_version_to_string(rs2_get_api_version(&e));
+        // RS2_API_FULL_VERSION_STR is the compile-time version (incl. build #); a loaded-library mismatch is caught separately via rs2_get_api_version()
+        _title_str = rsutils::string::from() << _title << " v" << RS2_API_FULL_VERSION_STR;
         auto debug = is_debug();
         if (debug)
         {
@@ -371,7 +380,14 @@ namespace rs2
 
         setup_icon();
 
-        ImGui_ImplGlfw_Init(_win, true);
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImPlot::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;   // added in order to prevents cursor chang when interacting with other element (when nedded remove the flag accordingly)
+        ImGui_ImplGlfw_InitForOpenGL(_win, true);
+        ImGui_ImplOpenGL3_Init();
 
         if (_use_glsl_render)
             _2d_vis = std::make_shared<visualizer_2d>(std::make_shared<splash_screen_shader>());
@@ -385,18 +401,21 @@ namespace rs2
 
         glfwSetCursorPosCallback(_win, [](GLFWwindow* w, double cx, double cy)
         {
+            ImGui_ImplGlfw_CursorPosCallback(w, cx, cy); // Forward the cursor position to ImGui
             auto data = reinterpret_cast<ux_window*>(glfwGetWindowUserPointer(w));
             data->_mouse.cursor = { (float)cx / data->_scale_factor,
                 (float)cy / data->_scale_factor };
         });
         glfwSetMouseButtonCallback(_win, [](GLFWwindow* w, int button, int action, int mods)
         {
+            ImGui_ImplGlfw_MouseButtonCallback(w, button, action, mods);// Forward the event to ImGui's GLFW implementation
             auto data = reinterpret_cast<ux_window*>(glfwGetWindowUserPointer(w));
             data->_mouse.mouse_down[0] = (button == GLFW_MOUSE_BUTTON_1) && (action != GLFW_RELEASE);
             data->_mouse.mouse_down[1] = (button == GLFW_MOUSE_BUTTON_2) && (action != GLFW_RELEASE);
         });
         glfwSetScrollCallback(_win, [](GLFWwindow * w, double xoffset, double yoffset)
         {
+            ImGui_ImplGlfw_ScrollCallback(w, xoffset, yoffset); // Forwards scroll events to ImGui
             auto data = reinterpret_cast<ux_window*>(glfwGetWindowUserPointer(w));
             data->_mouse.mouse_wheel = static_cast<int>(yoffset);
             data->_mouse.ui_wheel += static_cast<int>(yoffset);
@@ -414,6 +433,8 @@ namespace rs2
             }
         });
 
+        glfwSetKeyCallback(_win, ImGui_ImplGlfw_KeyCallback);
+
         rs2::gl::init_rendering(_use_glsl_render);
         if (_use_glsl_proc) rs2::gl::init_processing(_win, _use_glsl_proc);
 
@@ -426,7 +447,7 @@ namespace rs2
         // Prepare the splash screen and do some initialization in the background
         int x, y, comp;
         auto r = stbi_load_from_memory(splash, (int)splash_size, &x, &y, &comp, false);
-        _splash_tex.upload_image(x, y, r);
+        _splash_tex->upload_image(x, y, r);
         stbi_image_free(r);
     }
 
@@ -483,14 +504,14 @@ namespace rs2
             shader->set_power(power);
             shader->set_ray_center(float2{ ox, oy });
             shader->end();
-            _2d_vis->draw_texture(_splash_tex.get_gl_handle(), opacity);
+            _2d_vis->draw_texture(_splash_tex->get_gl_handle(), opacity);
         }
         else
         {
-            _splash_tex.show({ 0.f,0.f,float(_width),float(_height) }, opacity);
+            _splash_tex->show({ 0.f,0.f,float(_width),float(_height) }, opacity);
         }
 
-        std::string hourglass = u8"\uf251";
+        std::string hourglass = std::string(rsutils::string::from() << textual_icons::hourglass);
         static rsutils::time::periodic_timer every_200ms(std::chrono::milliseconds(200));
         bool do_200ms = every_200ms;
         if (_query_devices && do_200ms)
@@ -500,7 +521,8 @@ namespace rs2
 
             if (!_missing_device)
             {
-                _dev_stat_message = u8"\uf287 RealSense device detected.";
+                _dev_stat_message = std::string(rsutils::string::from() << textual_icons::usb
+                    << " RealSense device detected.");
                 _query_devices = false;
             }
         }
@@ -657,7 +679,11 @@ namespace rs2
         }
 
         ImGui::GetIO().Fonts->ClearFonts();  // To be refactored into Viewer theme object
-        ImGui_ImplGlfw_Shutdown();
+        ImPlot::DestroyContext();
+        RsImGui::PopNewFrame();
+        // Release the splash texture while the GL context is still current —
+        // member dtors below would otherwise run glDeleteTextures with no context.
+        _splash_tex.reset();
         glfwDestroyWindow(_win);
 
         glfwDestroyCursor(_hand_cursor);
@@ -742,9 +768,8 @@ namespace rs2
 
         ImGui::GetIO().MouseWheel = _mouse.ui_wheel;
         _mouse.ui_wheel = 0.f;
-
-        ImGui_ImplGlfw_NewFrame(_scale_factor);
-        //ImGui::NewFrame();
+        
+        RsImGui::PushNewFrame();
     }
 
     void ux_window::begin_viewport()
@@ -766,7 +791,7 @@ namespace rs2
         if (!_first_frame)
         {
             ImGui::Render();
-
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
             glfwSwapBuffers(_win);
             _mouse.mouse_wheel = 0;
         }
@@ -787,7 +812,7 @@ namespace rs2
         _first_frame = true;
         _app_ready = false;
         _splash_timer.reset();
-        _dev_stat_message = u8"\uf287 Please connect Intel RealSense device!";
+        _dev_stat_message = std::string(rsutils::string::from() << textual_icons::usb << " Please connect RealSense device!");
 
         {
             std::lock_guard<std::mutex> lock(_on_load_message_mtx);

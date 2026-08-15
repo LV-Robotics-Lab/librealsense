@@ -1,22 +1,26 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #include <cmath>
 #include "playback_device.h"
 #include "playback-device-info.h"
 #include "core/motion.h"
 #include "stream.h"
-#include "media/ros/ros_reader.h"
+#include "media/ros_factory.h"
+#include "media/ros_common.h"
 #include "environment.h"
 #include "sync.h"
 #include <src/depth-sensor.h>
 #include <src/color-sensor.h>
 #include <src/pose.h>
+#include <src/safety-sensor.h>
+#include <src/depth-mapping-sensor.h>
 
 #include <rsutils/string/from.h>
 
 
 using namespace librealsense;
+using namespace device_serializer;
 
 static bool is_video_stream( rs2_stream stream )
 {
@@ -27,7 +31,7 @@ std::shared_ptr< device_interface > playback_device_info::create_device()
 {
     auto playback_dev
         = std::make_shared< playback_device >( shared_from_this(),
-                                               std::make_shared< ros_reader >( _filename, get_context() ) );
+                                               create_reader_for_file( _filename, get_context() ) );
     return playback_dev;
 }
 
@@ -380,12 +384,14 @@ void playback_device::resume()
             return;
 
         auto total_duration = m_reader->query_duration();
-        if (m_last_published_timestamp >= total_duration)
-            m_last_published_timestamp = device_serializer::nanoseconds(0);
-        m_reader->reset();
-        m_reader->seek_to_time(m_last_published_timestamp);
-        while (m_last_published_timestamp != device_serializer::nanoseconds(0) && !m_reader->read_next_data()->is<serialized_frame>());
-
+        {
+            std::lock_guard< std::mutex > locker( m_last_published_timestamp_mutex );
+            if( m_last_published_timestamp >= total_duration )
+                m_last_published_timestamp = device_serializer::nanoseconds(0);
+            m_reader->reset();
+            m_reader->seek_to_time(m_last_published_timestamp);
+            while (m_last_published_timestamp != device_serializer::nanoseconds(0) && !m_reader->read_next_data()->is<serialized_frame>());
+        }
         m_is_paused = false;
         catch_up();
 
@@ -423,6 +429,11 @@ std::pair<uint32_t, rs2_extrinsics> playback_device::get_extrinsics(const stream
 bool playback_device::is_valid() const
 {
     return true;
+}
+
+bool playback_device::is_in_recovery_mode() const
+{
+    return false;
 }
 
 void playback_device::update_time_base(device_serializer::nanoseconds base_timestamp)
@@ -560,6 +571,7 @@ void playback_device::do_loop(T action)
                 }
             }
 
+            std::lock_guard<std::mutex> locker(m_last_published_timestamp_mutex);
             m_last_published_timestamp = device_serializer::nanoseconds(0);
         }
 
@@ -785,6 +797,8 @@ bool playback_device::try_extend_snapshot(std::shared_ptr<extension_snapshot>& e
     case RS2_EXTENSION_COLOR_SENSOR: return try_extend<color_sensor>(e, ext);
     case RS2_EXTENSION_MOTION_SENSOR: return try_extend<motion_sensor>(e, ext);
     case RS2_EXTENSION_FISHEYE_SENSOR: return try_extend<fisheye_sensor>(e, ext);
+    case RS2_EXTENSION_SAFETY_SENSOR: return try_extend<safety_sensor>(e, ext);
+    case RS2_EXTENSION_DEPTH_MAPPING_SENSOR: return try_extend<depth_mapping_sensor>(e, ext);
     case RS2_EXTENSION_UNKNOWN: //[[fallthrough]]
     case RS2_EXTENSION_COUNT:   //[[fallthrough]]
     default:

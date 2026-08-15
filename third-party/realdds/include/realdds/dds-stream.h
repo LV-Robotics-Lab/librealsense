@@ -1,10 +1,11 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
 #include "dds-stream-base.h"
 #include "dds-trinsics.h"
+#include "dds-sample.h"
 
 #include <string>
 #include <vector>
@@ -14,8 +15,8 @@
 namespace realdds {
 
 namespace topics {
-class image_msg;
 class imu_msg;
+class string_msg;
 class flexible_msg;
 }  // namespace topics
 
@@ -38,6 +39,8 @@ protected:
     dds_stream( std::string const & stream_name, std::string const & sensor_name );
 
 public:
+    ~dds_stream();
+
     bool is_open() const override { return !! _reader; }
     virtual void open( std::string const & topic_name, std::shared_ptr< dds_subscriber > const & ) = 0;
     virtual void close();
@@ -65,15 +68,30 @@ public:
 
     void open( std::string const & topic_name, std::shared_ptr< dds_subscriber > const & ) override;
 
-    typedef std::function< void( topics::image_msg && f ) > on_data_available_callback;
+    typedef std::function< void( std::vector< uint8_t > &&, dds_time &&, dds_sample && ) > on_data_available_callback;
     void on_data_available( on_data_available_callback cb ) { _on_data_available = cb; }
 
-    void set_intrinsics( const std::set< video_intrinsics > & intrinsics ) { _intrinsics = intrinsics; }
+    void set_intrinsics( std::set< video_intrinsics > intrinsics ) { _intrinsics = std::move( intrinsics ); }
     const std::set< video_intrinsics > & get_intrinsics() const { return _intrinsics; }
 
 protected:
     void handle_data() override;
     bool can_start_streaming() const override { return _on_data_available != nullptr; }
+
+    template< typename frame_type >
+    void handle_image()
+    {
+        frame_type frame;
+        dds_sample sample;
+        while( _reader && frame_type::take_next( *_reader, &frame, &sample ) )
+        {
+            if( ! frame.is_valid() )
+                continue;
+
+            if( is_streaming() && _on_data_available )
+                _on_data_available( std::move( frame.raw().data() ), frame.timestamp(), std::move( sample ) );
+        }
+    }
 
     std::set< video_intrinsics > _intrinsics;
     on_data_available_callback _on_data_available = nullptr;
@@ -130,7 +148,7 @@ public:
 
     void open( std::string const & topic_name, std::shared_ptr< dds_subscriber > const & ) override;
 
-    typedef std::function< void( topics::imu_msg && f ) > on_data_available_callback;
+    typedef std::function< void( topics::imu_msg &&, dds_sample && ) > on_data_available_callback;
     void on_data_available( on_data_available_callback cb ) { _on_data_available = cb; }
 
     void set_accel_intrinsics( const motion_intrinsics & intrinsics ) { _accel_intrinsics = intrinsics; }
@@ -147,6 +165,36 @@ protected:
     on_data_available_callback _on_data_available = nullptr;
 };
 
+class dds_inference_stream : public dds_stream
+{
+    typedef dds_stream super;
+
+public:
+    dds_inference_stream( std::string const & stream_name, std::string const & sensor_name );
+
+    char const * type_string() const override { return "inference"; }
+
+    void open( std::string const & topic_name, std::shared_ptr< dds_subscriber > const & ) override;
+
+    typedef std::function< void( topics::string_msg &&, dds_sample && ) > on_data_available_callback;
+    void on_data_available( on_data_available_callback cb ) { _on_data_available = cb; }
+
+protected:
+    void handle_data() override;
+    bool can_start_streaming() const override { return _on_data_available != nullptr; }
+
+    on_data_available_callback _on_data_available = nullptr;
+};
+
+class dds_object_detection_stream : public dds_inference_stream
+{
+    typedef dds_inference_stream super;
+
+public:
+    dds_object_detection_stream( std::string const & stream_name, std::string const & sensor_name );
+
+    char const * type_string() const override { return "object_detection"; }
+};
 
 typedef std::vector< std::shared_ptr< dds_stream > > dds_streams;
 

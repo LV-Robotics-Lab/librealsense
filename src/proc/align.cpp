@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #include <librealsense2/hpp/rs_sensor.hpp>
 #include <librealsense2/hpp/rs_processing.hpp>
@@ -10,12 +10,16 @@
 #include "environment.h"
 #include "align.h"
 #include "stream.h"
+#include <rsutils/easylogging/easyloggingpp.h>
 
 #if defined(RS2_USE_CUDA)
 #include "proc/cuda/cuda-align.h"
-#elif defined(__SSSE3__)
+#include "rsutils/accelerators/gpu.h"
+#endif
+#if defined(__SSSE3__)
 #include "proc/sse/sse-align.h"
 #endif
+#include "proc/neon/neon-align.h"
 
 namespace librealsense
 {
@@ -24,10 +28,20 @@ namespace librealsense
     std::shared_ptr<align> align::create_align(rs2_stream align_to)
     {
         #if defined(RS2_USE_CUDA)
+        if (rsutils::rs2_is_cuda_available())
+        {
+            LOG_INFO("Using CUDA-optimized align implementation");
             return std::make_shared<librealsense::align_cuda>(align_to);
-        #elif defined(__SSSE3__)
+        }
+        #endif
+        #if defined(__SSSE3__)
+            LOG_INFO("Using SSE-optimized align implementation");
             return std::make_shared<librealsense::align_sse>(align_to);
+        #elif defined(__ARM_NEON) && defined(BUILD_WITH_NEON) && !defined(ANDROID)
+            LOG_INFO("Using NEON-optimized align implementation");
+            return std::make_shared<librealsense::align_neon>(align_to);
         #else
+            LOG_INFO("Using generic (non-SIMD) align implementation");
             return std::make_shared<librealsense::align>(align_to);
         #endif
     }

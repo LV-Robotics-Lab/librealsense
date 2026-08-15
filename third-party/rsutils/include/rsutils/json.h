@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2022 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2022 RealSense, Inc. All Rights Reserved.
 #pragma once
 
 #include "json-fwd.h"
@@ -63,6 +63,7 @@ public:
 
     bool empty() const noexcept { return _j.empty(); }
     json::size_type size() const noexcept { return _j.size(); }
+    json::value_t type() const noexcept { return _j.type(); }
     json::const_iterator begin() const noexcept { return _j.begin(); }
     json::const_iterator end() const noexcept { return _j.end(); }
 
@@ -184,6 +185,19 @@ inline bool json_base::exists() const
 {
     return _ref().exists();
 }
+
+
+// WARNING: this "overrides" the implicit operator<T> that the *derived* class defines that does implicit casting!
+// I.e., if
+//      bool b = j;
+// used the implicit conversion ('bool b = j.get< bool >();') before, now it will do:
+//      bool b = j.exists();
+// In general, it is preferable to NEVER use implicit value conversions and instead stick to the .get<T>() syntax.
+inline json_base::operator bool() const
+{
+    return exists();
+}
+
 
 // Get the JSON as a value, or a default if not there (throws if wrong type)
 template< class T >

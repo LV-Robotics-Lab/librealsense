@@ -1,5 +1,5 @@
 /* License: Apache 2.0. See LICENSE file in root directory.
-Copyright(c) 2017 Intel Corporation. All Rights Reserved. */
+Copyright(c) 2017 RealSense, Inc. All Rights Reserved. */
 
 #include "pyrealsense2.h"
 #include <librealsense2/rs.h>
@@ -64,6 +64,7 @@ void init_c_files(py::module &m) {
     BIND_ENUM(m, rs2_playback_status, RS2_PLAYBACK_STATUS_COUNT, "") // No docsDtring in C++
     BIND_ENUM(m, rs2_calibration_type, RS2_CALIBRATION_TYPE_COUNT, "Calibration type for use in device_calibration")
     BIND_ENUM_CUSTOM(m, rs2_calibration_status, RS2_CALIBRATION_STATUS_FIRST, RS2_CALIBRATION_STATUS_LAST, "Calibration callback status for use in device_calibration.trigger_device_calibration")
+    BIND_ENUM(m, rs2_d500_intercam_sync_mode, RS2_D500_INTERCAM_SYNC_COUNT, "For D500: intercamera synchronization mode")
 
     /** rs_types.h **/
     py::class_<rs2_intrinsics> intrinsics(m, "intrinsics", "Video stream intrinsics.");
@@ -131,6 +132,40 @@ void init_c_files(py::module &m) {
             ss << "w: " << self.w;
             return ss.str();
         });
+
+    py::class_< rs2_combined_motion > combined_motion( m, "combined_motion", "IMU combined GYRO & ACCEL data" );
+    combined_motion.def( py::init<>() )
+        .def_property(
+            "angular_velocity",
+            []( rs2_combined_motion const & self )
+            {
+                return rs2_vector{ (float)self.angular_velocity.x,
+                                   (float)self.angular_velocity.y,
+                                   (float)self.angular_velocity.z };
+            },
+            []( rs2_combined_motion & self, rs2_vector const & v ) {
+                self.angular_velocity = { v.x, v.y, v.z };
+            } )
+        .def_property(
+            "linear_acceleration",
+            []( rs2_combined_motion const & self )
+            {
+                return rs2_vector{ (float)self.linear_acceleration.x,
+                                   (float)self.linear_acceleration.y,
+                                   (float)self.linear_acceleration.z };
+            },
+            []( rs2_combined_motion & self, rs2_vector const & v ) {
+                self.linear_acceleration = { v.x, v.y, v.z };
+            } )
+        .def( "__repr__",
+              []( const rs2_combined_motion & self )
+              {
+                  std::ostringstream ss;
+                  ss << "gyro[" << self.angular_velocity.x << "," << self.angular_velocity.y << ","
+                      << self.angular_velocity.z << "] accel[" << self.linear_acceleration.x << ","
+                      << self.linear_acceleration.y << "," << self.linear_acceleration.z << "]";
+                  return ss.str();
+              } );
 
     py::class_<rs2_pose> pose(m, "pose"); // No docstring in C++
     pose.def(py::init<>())

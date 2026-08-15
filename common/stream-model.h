@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2023 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -8,6 +8,7 @@
 #include <imgui.h>
 #include "reflectivity/reflectivity.h"
 #include <rsutils/number/stabilized-value.h>
+#include <graph-model.h>
 
 namespace rs2
 {
@@ -43,7 +44,13 @@ namespace rs2
         bool is_stream_alive();
         void show_stream_footer(ImFont* font, const rect &stream_rect, const mouse_info& mouse, const std::map<int, stream_model> &streams, viewer_model& viewer);
         void show_stream_header(ImFont* font, const rect& stream_rect, viewer_model& viewer);
-        void show_stream_imu(ImFont* font, const rect& stream_rect, const rs2_vector& axis, const mouse_info& mouse);
+        float show_stream_imu( ImFont * font,
+                               const rect & stream_rect,
+                               const rs2_vector & axis,
+                               const mouse_info & mouse,
+                               char const * units,
+                               char const * title = nullptr,
+                               float y_offset = 0.f );
         void show_stream_pose(ImFont* font, const rect& stream_rect, const rs2_pose& pose_data,
             rs2_stream stream_type, bool fullScreen, float y_offset, viewer_model& viewer);
 
@@ -97,6 +104,11 @@ namespace rs2
         temporal_event _stream_not_alive;
         bool show_map_ruler = true;
         bool show_metadata = false;
+        bool show_safety_zones_2d = true;
+
+        std::shared_ptr<graph_model> graph;
+        bool show_graph = false;
+        bool graph_initialized = false;
 
         animated<float> _info_height{ 0.f };
         int _prev_mouse_pos_x = 0;
@@ -106,8 +118,16 @@ namespace rs2
         std::unique_ptr< reflectivity > _reflectivity;
         rsutils::number::stabilized_value<float> _stabilized_reflectivity;
 
+        std::string smcu_internal_state_to_string(rs2_metadata_type& attribute_val) const;
         std::string format_value(rs2_frame_metadata_value& md_val, rs2_metadata_type& attribute_val) const;
         bool should_show_in_hex(rs2_frame_metadata_value& md_val) const;
+        void create_graph(rs2_stream stream_type);
+        void show_metadata_by_default(const rs2::stream_profile& p);
+        void add_d585S_metadata_descriptions(std::map<rs2_frame_metadata_value, std::string>& descriptions) const;
+        std::string adapt_d585S_metadata_name(const std::string& name) const;
+        void add_dds_metadata_descriptions(std::map<rs2_frame_metadata_value, std::string>& descriptions) const;
+        void deal_d585S_metadata_md_values_special_cases(const frame& f);
+        std::string get_meaning(const rs2_frame_metadata_value& md_val, const std::vector<std::string>& reasons, const std::string& reason_for_zero = "") const;
     };
 
     

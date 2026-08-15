@@ -1,57 +1,82 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2024 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2024 RealSense, Inc. All Rights Reserved.
 
 #include "post-processing-filters-list.h"
 #include "post-processing-block-model.h"
+#ifdef BUILD_WITH_CLOSE_RANGE_DEPTH
+#include "close-range-depth-filter.h"
+#include "rs-depth-range-loader.h"
+#endif
 #include <imgui_internal.h>
+#include <realsense_imgui.h>
 
 #include "metadata-helper.h"
 #include "subdevice-model.h"
+#include <rsutils/accelerators/gpu.h>
 
 namespace rs2
 {
-    static void width_height_from_resolution(rs2_sensor_mode mode, int& width, int& height)
+    // --- subdevice_model::config_save_worker ---------------------------------------------------
+    // Defined out-of-line; the class is declared as a private nested type in subdevice-model.h.
+
+    subdevice_model::config_save_worker & subdevice_model::config_save_worker::instance()
     {
-        switch (mode)
+        static config_save_worker w;
+        return w;
+    }
+
+    subdevice_model::config_save_worker::config_save_worker()
+        : _worker( [this] { run(); } )
+    {
+    }
+
+    subdevice_model::config_save_worker::~config_save_worker()
+    {
         {
-        case RS2_SENSOR_MODE_VGA:
-            width = 640;
-            height = 480;
-            break;
-        case RS2_SENSOR_MODE_XGA:
-            width = 1024;
-            height = 768;
-            break;
-        case RS2_SENSOR_MODE_QVGA:
-            width = 320;
-            height = 240;
-            break;
-        default:
-            width = height = 0;
-            break;
+            std::lock_guard< std::mutex > lk( _mtx );
+            _stop = true;
+        }
+        _cv.notify_one();
+        if( _worker.joinable() ) _worker.join();
+    }
+
+    void subdevice_model::config_save_worker::post( void * key, std::function< void() > job )
+    {
+        {
+            std::lock_guard< std::mutex > lk( _mtx );
+            _pending[key] = std::move( job );
+        }
+        _cv.notify_one();
+    }
+
+    void subdevice_model::config_save_worker::cancel( void * key )
+    {
+        std::lock_guard< std::mutex > lk( _mtx );
+        _pending.erase( key );
+    }
+
+    void subdevice_model::config_save_worker::run()
+    {
+        for( ;; )
+        {
+            std::vector< std::function< void() > > jobs;
+            bool stopping = false;
+            {
+                std::unique_lock< std::mutex > lk( _mtx );
+                _cv.wait( lk, [this] { return _stop || ! _pending.empty(); } );
+                stopping = _stop;
+                for( auto & kv : _pending ) jobs.push_back( std::move( kv.second ) );
+                _pending.clear();
+            }
+            for( auto & job : jobs )
+            {
+                try { job(); } catch( ... ) {}
+            }
+            if( stopping ) return;
         }
     }
 
-    static int get_resolution_id_from_sensor_mode(rs2_sensor_mode sensor_mode,
-        const std::vector< std::pair< int, int > >& res_values)
-    {
-        int width = 0, height = 0;
-        width_height_from_resolution(sensor_mode, width, height);
-        auto iter = std::find_if(res_values.begin(),
-            res_values.end(),
-            [width, height](std::pair< int, int > res) {
-                if (((res.first == width) && (res.second == height))
-                    || ((res.first == height) && (res.second == width)))
-                    return true;
-                return false;
-            });
-        if (iter != res_values.end())
-        {
-            return static_cast<int>(std::distance(res_values.begin(), iter));
-        }
-
-        throw std::runtime_error("cannot convert sensor mode to resolution ID");
-    }
+    // -------------------------------------------------------------------------------------------
 
     std::vector<const char*> get_string_pointers(const std::vector<std::string>& vec)
     {
@@ -60,7 +85,7 @@ namespace rs2
         return res;
     }
 
-    std::string get_device_sensor_name(subdevice_model* sub)
+    std::string get_post_processing_device_sensor_name(subdevice_model* sub)
     {
         std::stringstream ss;
         ss << configurations::viewer::post_processing
@@ -73,13 +98,15 @@ namespace rs2
                                             bool * options_invalidated,
                                             std::string & error_message )
     {
-        for (rs2::option_value option : s->get_supported_option_values())
-        {
-            options_metadata[option->id]
-                = create_option_model( option, opt_base_label, this, s, options_invalidated, error_message );
-        }
         try
         {
+            auto supported_options = s->get_supported_option_values();
+            for( rs2::option_value option : supported_options )
+            {
+                options_metadata[option->id]
+                    = create_option_model( option, opt_base_label, this, s, options_invalidated, error_message );
+            }
+
             s->on_options_changed( [this]( const options_list & list )
             {
                 for( auto changed_option : list )
@@ -87,7 +114,7 @@ namespace rs2
                     auto it = options_metadata.find( changed_option->id );
                     if( it != options_metadata.end() && ! _destructing ) // Callback runs in different context, check options_metadata still valid
                     {
-                        it->second.value = changed_option;
+                        it->second.update_value( changed_option, *viewer.not_model );
                     }
                 }
             } );
@@ -99,76 +126,42 @@ namespace rs2
         }
     }
 
-    // to be moved to processing-block-model
-    bool restore_processing_block(const char* name,
-        std::shared_ptr<rs2::processing_block> pb, bool enable)
-    {
-        for (auto opt : pb->get_supported_options())
-        {
-            std::string key = name;
-            key += ".";
-            key += pb->get_option_name(opt);
-            if (config_file::instance().contains(key.c_str()))
-            {
-                float val = config_file::instance().get(key.c_str());
-                try
-                {
-                    auto range = pb->get_option_range(opt);
-                    if (val >= range.min && val <= range.max)
-                        pb->set_option(opt, val);
-                }
-                catch (...)
-                {
-                }
-            }
-        }
-
-        std::string key = name;
-        key += ".enabled";
-        if (config_file::instance().contains(key.c_str()))
-        {
-            return config_file::instance().get(key.c_str());
-        }
-        return enable;
-    }
-
     subdevice_model::subdevice_model(
         device& dev,
         std::shared_ptr<sensor> s,
         std::shared_ptr< atomic_objects_in_frame > device_detected_objects,
         std::string& error_message,
         viewer_model& viewer,
+        device_model* dev_model,
         bool new_device_connected
     )
-        : s(s), dev(dev), ui(), last_valid_ui(),
+        : s(s), dev(dev), ui(), last_valid_ui(), dev_model(dev_model),
         streaming(false), _pause(false),
         depth_colorizer(std::make_shared<rs2::gl::colorizer>()),
         yuy2rgb(std::make_shared<rs2::gl::yuy_decoder>()),
+        m420_to_rgb(std::make_shared<rs2::gl::m420_decoder>()),
+        nv12_to_rgb(std::make_shared<rs2::gl::nv12_decoder>()),
         y411(std::make_shared<rs2::gl::y411_decoder>()),
         viewer(viewer),
         detected_objects(device_detected_objects),
-        _destructing( false )
+        _destructing( false ),
+        // Queue capacity is generous: even rapid slider drags coalesce into at most one
+        // queued job per option (see option_model::set_option_async), so realistically
+        // depth ≪ 16.
+        _set_dispatcher( std::make_shared< dispatcher >( 64u ) )
     {
+        // dispatcher's worker thread starts in _was_stopped=true; invoke() is a
+        // silent no-op until start() is called. (The header comment claiming it
+        // "starts out 'started'" disagrees with the constructor in src/dispatcher.cpp.)
+        _set_dispatcher->start();
         supported_options = s->get_supported_options();
         restore_processing_block("colorizer", depth_colorizer);
         restore_processing_block("yuy2rgb", yuy2rgb);
+        restore_processing_block("m420_to_rgb", m420_to_rgb);
+        restore_processing_block("nv12_to_rgb", nv12_to_rgb);
         restore_processing_block("y411", y411);
 
-        std::string device_name(dev.get_info(RS2_CAMERA_INFO_NAME));
-        std::string sensor_name(s->get_info(RS2_CAMERA_INFO_NAME));
-
-        std::stringstream ss;
-        ss << configurations::viewer::post_processing
-            << "." << device_name
-            << "." << sensor_name;
-        auto key = ss.str();
-
-        bool const is_rgb_camera = s->is< color_sensor >();
-
-        if (config_file::instance().contains(key.c_str()))
-        {
-            post_processing_enabled = config_file::instance().get(key.c_str());
-        }
+        post_processing_enabled = is_post_processing_enabled_in_config_file();
 
         try
         {
@@ -194,7 +187,74 @@ namespace rs2
         }
         catch (...) {}
 
-        auto filters = s->get_recommended_filters();
+        bool const is_rgb_camera = s->is< color_sensor >();
+
+        // The close-range improver must run before get_recommended_filters() (decimation, spatial, temporal…).
+        // Decimation halves depth resolution while leaving IR unchanged; the mismatch would
+        // trigger the resolution guard in close_range_depth_improver::apply() and silently skip the improver.
+#ifdef BUILD_WITH_CLOSE_RANGE_DEPTH
+        if( !is_rgb_camera && s->supports( RS2_OPTION_STEREO_BASELINE ) )
+        {
+            auto block = std::make_shared< close_range_depth_filter >();
+            auto model = std::make_shared< processing_block_model >(
+                this, "Improved Close Range Depth", block,
+                [block]( rs2::frame f ) { return block->process( f ); },
+                error_message, false );
+
+            if( ! get_rs_depth_range_loader().is_loaded() )
+            {
+                model->available = []() { return false; };
+                model->unavailable_tooltip = "Improved Close Range Depth library not found; install librealsense2-enhanced-depth package";
+            }
+            else if( !rsutils::rs2_is_cuda_available() )
+            {
+                model->available = []() { return false; };
+                model->unavailable_tooltip = "Improved Close Range Depth requires CUDA (not detected on this system)";
+            }
+            else
+            {
+                // Safe to capture this: the lambda lives in model which lives in post_processing,
+                // a member of this subdevice_model — so the lambda cannot outlive its owner.
+                model->available = [this]()
+                {
+                    // Resolution check — VGA (640x480) minimum
+                    if( ui.is_multiple_resolutions )
+                    {
+                        // Per-stream resolutions: check depth and IR independently
+                        auto check = [&]( rs2_stream stream ) {
+                            auto it = ui.selected_stream_to_res.find( stream );
+                            if( it == ui.selected_stream_to_res.end() ) return false;
+                            return it->second.first >= 640 && it->second.second >= 480;
+                        };
+                        if( !check( RS2_STREAM_DEPTH ) || !check( RS2_STREAM_INFRARED ) )
+                            return false;
+                    }
+                    else if( !res_values.empty()
+                             && ui.selected_res_id >= 0
+                             && ui.selected_res_id < static_cast< int >( res_values.size() ) )
+                    {
+                        const auto& res = res_values.at( ui.selected_res_id );
+                        if( res.first < 640 || res.second < 480 )
+                            return false;
+                    }
+
+                    bool depth = false, ir1 = false, ir2 = false;
+                    for( auto& p : profiles )
+                    {
+                        auto it = stream_enabled.find( p.unique_id() );
+                        if( it == stream_enabled.end() || !it->second ) continue;
+                        if( p.stream_type() == RS2_STREAM_DEPTH ) depth = true;
+                        else if( p.stream_type() == RS2_STREAM_INFRARED && p.stream_index() == 1 ) ir1 = true;
+                        else if( p.stream_type() == RS2_STREAM_INFRARED && p.stream_index() == 2 ) ir2 = true;
+                    }
+                    return depth && ir1 && ir2;
+                };
+                model->unavailable_tooltip = "Depth, IR Left/Right streams have to be enabled at VGA or higher resolution";
+            }
+
+            post_processing.push_back( model );
+        }
+#endif
 
         for (auto&& f : s->get_recommended_filters())
         {
@@ -215,6 +275,9 @@ namespace rs2
                     model->enable(false);
             }
 
+            if( shared_filter->is< rotation_filter >() )
+                model->enable( false );
+
             if (shared_filter->is<threshold_filter>())
             {
                 if (s->supports(RS2_CAMERA_INFO_PRODUCT_ID))
@@ -223,23 +286,32 @@ namespace rs2
                     std::string device_pid = s->get_info(RS2_CAMERA_INFO_PRODUCT_ID);
                     if (device_pid == "0B5B")
                     {
-                        std::string error_msg;
                         auto threshold_pb = shared_filter->as<threshold_filter>();
                         threshold_pb.set_option(RS2_OPTION_MIN_DISTANCE, SHORT_RANGE_MIN_DISTANCE);
                         threshold_pb.set_option(RS2_OPTION_MAX_DISTANCE, SHORT_RANGE_MAX_DISTANCE);
                     }
                 }
+                model->enable( false );
             }
 
             if (shared_filter->is<hdr_merge>())
             {
                 // processing block will be skipped if the requested option is not supported
-                auto supported_options = s->get_supported_options();
                 if (std::find(supported_options.begin(), supported_options.end(), RS2_OPTION_SEQUENCE_ID) == supported_options.end())
                     continue;
             }
 
             post_processing.push_back(model);
+        }
+
+        for (auto&& f : s->query_embedded_filters())
+        {
+            auto shared_filter = std::make_shared<embedded_filter>(f);
+
+            auto model = std::make_shared<embedded_filter_model>(
+                this, shared_filter->get_type(), shared_filter, viewer, error_message);
+
+            embedded_filters.push_back(model);
         }
 
         if (is_rgb_camera)
@@ -289,7 +361,19 @@ namespace rs2
             depth_colorizer->set_option(RS2_OPTION_VISUAL_PRESET, option_value);
         }
 
-        ss.str("");
+        // Disable histogram equalization for D585 prototype variants (0C07, 0C08).
+        // Must be applied AFTER the VISUAL_PRESET restore block above: re-setting the Dynamic
+        // preset (default) re-enables histogram equalization via its on_set callback.
+        if (s->supports(RS2_CAMERA_INFO_PRODUCT_ID))
+        {
+            std::string device_pid = s->get_info(RS2_CAMERA_INFO_PRODUCT_ID);
+            if (device_pid == "0C07" || device_pid == "0C08")
+            {
+                depth_colorizer->set_option(RS2_OPTION_HISTOGRAM_EQUALIZATION_ENABLED, 0.f);
+            }
+        }
+
+        std::stringstream ss;
         ss << "##" << dev.get_info(RS2_CAMERA_INFO_NAME)
             << "/" << s->get_info(RS2_CAMERA_INFO_NAME)
             << "/" << (long long)this;
@@ -318,6 +402,7 @@ namespace rs2
             std::map<int, rs2_format> def_format{ {0, RS2_FORMAT_ANY} };
             auto default_resolution = std::make_pair(1280, 720);
             auto default_fps = 30;
+            std::map<int, int> def_fps_per_stream;   // per-stream default-profile FPS (by unique_id)
             for (auto&& profile : sensor_profiles)
             {
                 std::stringstream res;
@@ -342,11 +427,14 @@ namespace rs2
                             }
                         }
                     }
-                    res << vid_prof.width() << " x " << vid_prof.height();
-                    push_back_if_not_exists(res_values, std::pair<int, int>(vid_prof.width(), vid_prof.height()));
-                    push_back_if_not_exists(resolutions, res.str());
-                    push_back_if_not_exists(resolutions_per_stream[profile.stream_type()], std::pair<int, int>(vid_prof.width(), vid_prof.height()));
-                    push_back_if_not_exists(profile_id_to_res[profile.unique_id()], std::pair<int, int>(vid_prof.width(), vid_prof.height()));
+                    
+                    if (!hide_resolutions(profile))
+                    {
+                        res << vid_prof.width() << " x " << vid_prof.height();
+                        push_back_if_not_exists(res_values, std::pair<int, int>(vid_prof.width(), vid_prof.height()));
+                        push_back_if_not_exists(resolutions, res.str());
+                        push_back_if_not_exists(resolutions_per_stream[profile.stream_type()], std::pair<int, int>(vid_prof.width(), vid_prof.height()));
+                    }
                 }
 
                 std::stringstream fps;
@@ -366,6 +454,7 @@ namespace rs2
                 {
                     stream_enabled[profile.unique_id()] = true;
                     def_format[profile.unique_id()] = profile.format();
+                    def_fps_per_stream[profile.unique_id()] = profile.fps();
                 }
 
                 profiles.push_back(profile);
@@ -388,24 +477,36 @@ namespace rs2
             }
             sort_together(res_values, resolutions);
 
-            show_single_fps_list = is_there_common_fps();
+            // Compute common FPS once and reuse it for mode decision and shared default (video streams)
+            auto common_fps = get_common_fps();
+            show_single_fps_list = !common_fps.empty() && !res_values.empty();
 
             int selection_index{};
 
             if (!show_single_fps_list)
             {
-                for (auto fps_array : fps_values_per_stream)
+                // Each stream gets its own FPS selection. Prefer the stream's own default-profile FPS.
+                // Assign for every stream so all land on a valid profile.
+                for (const auto& fps_array : fps_values_per_stream)
                 {
-                    if (get_default_selection_index(fps_array.second, default_fps, &selection_index))
-                    {
-                        ui.selected_fps_id[fps_array.first] = selection_index;
-                        break;
-                    }
+                    if (fps_array.second.empty())
+                        continue;
+                    auto def_it = def_fps_per_stream.find(fps_array.first);
+                    int stream_default = (def_it != def_fps_per_stream.end()) ? def_it->second : default_fps;
+                    get_default_selection_index(fps_array.second, stream_default, &selection_index);
+                    ui.selected_fps_id[fps_array.first] = selection_index;
                 }
             }
             else
             {
-                if (get_default_selection_index(shared_fps_values, default_fps, &selection_index))
+                // The single shared FPS is applied to all streams, so the default must be a
+                // value every stream supports. Prefer default_fps when it's common; otherwise
+                // fall back to the highest common FPS (the union's min/max may not be common -
+                // e.g. motion's union {100,200,400} where only 200 is common).
+                int desired = default_fps;
+                if (std::find(common_fps.begin(), common_fps.end(), default_fps) == common_fps.end())
+                    desired = *std::max_element(common_fps.begin(), common_fps.end());
+                if (get_default_selection_index(shared_fps_values, desired, &selection_index))
                     ui.selected_shared_fps_id = selection_index;
             }
 
@@ -420,13 +521,9 @@ namespace rs2
             if (is_multiple_resolutions_supported())
             {
                 ui.is_multiple_resolutions = true;
-                auto default_res = std::make_pair(1280, 960);
-                for (auto res_array : profile_id_to_res)
+                for (auto res_array : resolutions_per_stream)
                 {
-                    if (get_default_selection_index(res_array.second, default_res, &selection_index))
-                    {
-                        ui.selected_res_id_map[res_array.first] = selection_index;
-                    }
+                    ui.selected_stream_to_res[res_array.first] = default_resolution;
                 }
             }
             else
@@ -435,39 +532,23 @@ namespace rs2
                 ui.selected_res_id = selection_index;
             }
 
-            if (new_device_connected)
-            {
-                // Have the various preset options automatically update based on the resolution of the
-                // (closed) stream...
-                // TODO we have no res_values when loading color rosbag, and color sensor isn't
-                // even supposed to support SENSOR_MODE... see RS5-7726
-                if (s->supports(RS2_OPTION_SENSOR_MODE) && !res_values.empty())
-                {
-                    // Watch out for read-only options in the playback sensor!
-                    try
-                    {
-                        auto requested_sensor_mode = static_cast<float>(resolution_from_width_height(
-                            res_values[ui.selected_res_id].first,
-                            res_values[ui.selected_res_id].second));
-
-                        auto currest_sensor_mode = s->get_option(RS2_OPTION_SENSOR_MODE);
-
-                        if (requested_sensor_mode != currest_sensor_mode)
-                            s->set_option(RS2_OPTION_SENSOR_MODE, requested_sensor_mode);
-                    }
-                    catch (not_implemented_error const&)
-                    {
-                        // Just ignore for now: need to figure out a way to write to playback sensors...
-                    }
-                }
-            }
-
             if (ui.is_multiple_resolutions)
             {
-                for (auto it = ui.selected_res_id_map.begin(); it != ui.selected_res_id_map.end(); ++it)
+                for (auto it = ui.selected_stream_to_res.begin(); it != ui.selected_stream_to_res.end(); ++it)
                 {
-                    while (it->second >= 0 && !is_selected_combination_supported())
-                        it->second--;
+                    if (!is_selected_combination_supported())
+                    {
+                        auto cur_stream = it->first;
+                        auto resolutions_for_current_stream = resolutions_per_stream[cur_stream];
+                        if (resolutions_for_current_stream.size() == 0)
+                            throw std::runtime_error("Multiple Resolution Issue, please check your requested resolution");
+
+                        auto res_it = resolutions_for_current_stream.end() - 1;
+                        ui.selected_stream_to_res[cur_stream] = *res_it;
+
+                        while (res_it->first && !is_selected_combination_supported())
+                            --res_it;
+                    }
                 }
             }
             else
@@ -481,13 +562,27 @@ namespace rs2
         {
             error_message = error_to_string(e);
         }
-        populate_options(ss.str().c_str(), &_options_invalidated, error_message);
-
+        _opt_base_label = ss.str();
+        populate_options(_opt_base_label.c_str(), &_options_invalidated, error_message);
     }
 
     subdevice_model::~subdevice_model()
     {
+        // cancel() drops any not-yet-started save job for this subdevice. If the
+        // worker has already dequeued and is running our lambda, cancel is a no-op —
+        // but that's safe because the lambda intentionally captures only shared_ptrs
+        // to the processing blocks (by value), never `this`. So `subdevice_model`'s
+        // dtor doesn't need to wait for the worker; the in-flight save will finish on
+        // its own without dereferencing any member of *this.
+        config_save_worker::instance().cancel( this );
         _destructing = true;
+        try
+        {
+            wait_for_stop();
+        }
+        catch( ... )
+        {
+        }
         try
         {
             s->on_options_changed( []( const options_list & list ) {} );
@@ -495,6 +590,32 @@ namespace rs2
         catch( ... )
         {
         }
+    }
+
+    void subdevice_model::repopulate_options()
+    {
+        std::string error_message;
+        populate_options(_opt_base_label.c_str(), &_options_invalidated, error_message);
+    }
+
+    bool subdevice_model::is_post_processing_enabled_in_config_file() const
+    {
+        bool is_enabled = false;
+
+        std::string device_name(dev.get_info(RS2_CAMERA_INFO_NAME));
+        std::string sensor_name(s->get_info(RS2_CAMERA_INFO_NAME));
+
+        std::stringstream ss;
+        ss << configurations::viewer::post_processing
+            << "." << device_name
+            << "." << sensor_name;
+        auto key = ss.str();
+
+        if (config_file::instance().contains(key.c_str()))
+        {
+            is_enabled = config_file::instance().get(key.c_str());
+        }
+        return is_enabled;
     }
 
     void subdevice_model::sort_resolutions(std::vector<std::pair<int, int>>& resolutions) const
@@ -507,33 +628,46 @@ namespace rs2
             });
     }
 
-    bool subdevice_model::is_there_common_fps()
+    // Returns the FPS values supported by every (non-empty) stream of this subdevice - the
+    // intersection of the per-stream FPS lists. e.g. depth/IR expose {90,30,25,20,15,5} and a
+    // color stream exposes {30,25,20,15} -> common {30,25,20,15}; accel {100,200} and gyro
+    // {200,400} -> common {200}. Empty when the streams share no rate (per-stream FPS needed).
+    std::vector<int> subdevice_model::get_common_fps() const
     {
-        std::vector<int> first_fps_group;
-        size_t group_index = 0;
-        for (; group_index < fps_values_per_stream.size(); ++group_index)
+        std::vector<int> common;
+        bool first = true;
+        for (auto&& kvp : fps_values_per_stream)
         {
-            if (!fps_values_per_stream[(rs2_stream)group_index].empty())
-            {
-                first_fps_group = fps_values_per_stream[(rs2_stream)group_index];
-                break;
-            }
-        }
-
-        for (size_t i = group_index + 1; i < fps_values_per_stream.size(); ++i)
-        {
-            auto fps_group = fps_values_per_stream[(rs2_stream)i];
+            const auto& fps_group = kvp.second;
             if (fps_group.empty())
                 continue;
 
-            auto fps1 = first_fps_group[0];
-            auto it = std::find_if( std::begin( fps_group ),
-                                    std::end( fps_group ),
-                                    [&]( const int & fps2 ) { return fps2 == fps1; } );
-            if( it == std::end( fps_group ) )
-                return false;
+            if (first)
+            {
+                common = fps_group;
+                first = false;
+                continue;
+            }
+
+            // keep only the values from common that also appear in this stream's list
+            std::vector<int> updated;
+            for (auto fps : common)
+            {
+                if (std::find(fps_group.begin(), fps_group.end(), fps) != fps_group.end())
+                    updated.push_back(fps);
+            }
+            common = updated;
         }
-        return true;
+        return common;
+    }
+
+    // A single shared FPS list can be presented only if all the streams share at least one
+    // common FPS value. We intersect the per-stream lists rather than testing a single value:
+    // the old check compared only one stream's extreme value (e.g. 90 or 5), which the others
+    // lack, and wrongly concluded there was no common FPS.
+    bool subdevice_model::is_there_common_fps()
+    {
+        return !get_common_fps().empty();
     }
 
     bool subdevice_model::draw_resolutions(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1)
@@ -558,55 +692,17 @@ namespace rs2
             }
             else
             {
-                ImGui::PushItemWidth(-1);
+                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 25 ); // Set the width for the combo box itself with a 25 buffer 
                 ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, { 1,1,1,1 });
                 auto tmp_selected_res_id = ui.selected_res_id;
-                if (ImGui::Combo(label.c_str(), &tmp_selected_res_id, res_chars.data(),
+                if (RsImGui::CustomComboBox(label.c_str(), &tmp_selected_res_id, res_chars.data(),
                     static_cast<int>(res_chars.size())))
                 {
                     res = true;
                     _options_invalidated = true;
 
-                    // Set sensor mode only at the Viewer app,
-                    // DQT app will handle the sensor mode when the streaming is off (while reseting the stream)
-                    if (s->supports(RS2_OPTION_SENSOR_MODE) && !allow_change_resolution_while_streaming)
-                    {
-                        auto width = res_values[tmp_selected_res_id].first;
-                        auto height = res_values[tmp_selected_res_id].second;
-                        auto res = resolution_from_width_height(width, height);
-                        if (res >= RS2_SENSOR_MODE_VGA && res < RS2_SENSOR_MODE_COUNT)
-                        {
-                            try
-                            {
-                                s->set_option(RS2_OPTION_SENSOR_MODE, float(res));
-                            }
-                            catch (const error& e)
-                            {
-                                error_message = error_to_string(e);
-                            }
+                    ui.selected_res_id = tmp_selected_res_id;
 
-                            // Only update the cached value once set_option is done! That way, if it doesn't change anything...
-                            try
-                            {
-                                int sensor_mode_val = static_cast<int>(s->get_option(RS2_OPTION_SENSOR_MODE));
-                                {
-                                    ui.selected_res_id = get_resolution_id_from_sensor_mode(
-                                        static_cast<rs2_sensor_mode>(sensor_mode_val),
-                                        res_values);
-                                }
-                            }
-                            catch (...) {}
-                        }
-                        else
-                        {
-                            error_message = rsutils::string::from() << "Resolution " << width << "x" << height
-                                << " is not supported on this device";
-                        }
-                    }
-                    else
-                    {
-                        ui.selected_res_id = tmp_selected_res_id;
-                    }
                 }
                 ImGui::PopStyleColor();
                 ImGui::PopItemWidth();
@@ -637,9 +733,9 @@ namespace rs2
             }
             else
             {
-                ImGui::PushItemWidth(-1);
+                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 25); // Set the width for the combo box itself with a 25 buffer 
                 ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, { 1,1,1,1 });
-                if (ImGui::Combo(label.c_str(), &ui.selected_shared_fps_id, fps_chars.data(),
+                if (RsImGui::CustomComboBox(label.c_str(), &ui.selected_shared_fps_id, fps_chars.data(),
                     static_cast<int>(fps_chars.size())))
                 {
                     res = true;
@@ -686,6 +782,37 @@ namespace rs2
                     if (ImGui::Checkbox(label.c_str(), &stream_enabled[f.first]))
                     {
                         prev_stream_enabled = tmp;
+                        res = true;
+
+                        if (stream_enabled[f.first])
+                        {
+                            // Find the stream type for this unique_id
+                            rs2_stream stream_type = RS2_STREAM_ANY;
+                            for (auto& p : profiles)
+                            {
+                                if (p.unique_id() == f.first)
+                                {
+                                    stream_type = p.stream_type();
+                                    break;
+                                }
+                            }
+
+                            // If the currently selected resolution is not valid for the newly
+                            // enabled stream, auto-select the first resolution that is
+                            if (stream_type != RS2_STREAM_ANY)
+                            {
+                                auto it = resolutions_per_stream.find(stream_type);
+                                if (it != resolutions_per_stream.end() && !it->second.empty())
+                                {
+                                    auto& valid_res = it->second;
+                                    auto current_res = res_values[ui.selected_res_id];
+                                    bool valid = std::any_of(valid_res.begin(), valid_res.end(),
+                                        [&](const std::pair<int, int>& r) { return r == current_res; });
+                                    if (!valid)
+                                        select_resolution(valid_res[0].first, valid_res[0].second);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -716,9 +843,9 @@ namespace rs2
                 }
                 else
                 {
-                    ImGui::PushItemWidth(-1);
+                    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 25); // Set the width for the combo box itself with a 25 buffer 
                     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, { 1,1,1,1 });
-                    ImGui::Combo(label.c_str(), &ui.selected_format_id[f.first], formats_chars.data(),
+                    RsImGui::CustomComboBox(label.c_str(), &ui.selected_format_id[f.first], formats_chars.data(),
                         static_cast<int>(formats_chars.size()));
                     ImGui::PopStyleColor();
                     ImGui::PopItemWidth();
@@ -743,9 +870,9 @@ namespace rs2
                     }
                     else
                     {
-                        ImGui::PushItemWidth(-1);
+                        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 25); // Set the width for the combo box itself with a 25 buffer 
                         ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, { 1,1,1,1 });
-                        ImGui::Combo(label.c_str(), &ui.selected_fps_id[f.first], fps_chars.data(),
+                        RsImGui::CustomComboBox(label.c_str(), &ui.selected_fps_id[f.first], fps_chars.data(),
                             static_cast<int>(fps_chars.size()));
                         ImGui::PopStyleColor();
                         ImGui::PopItemWidth();
@@ -758,15 +885,42 @@ namespace rs2
         return res;
     }
 
+    int subdevice_model::get_res_id_in_resolutions_array(const std::vector<const char*>& res_chars, const std::pair<int, int>& res) const
+    {
+        int id = -1;
+        std::stringstream ss;
+        ss << res.first << "x" << res.second;
+        for (int i = 0; i < res_chars.size(); ++i)
+        {
+            auto cur_res = std::string(res_chars[i]);
+            if (cur_res == ss.str())
+            {
+                id = i;
+                break;
+            }
+        }
+        if (id == -1)
+            throw std::runtime_error("Multiple Resolution Issue, please check the requested resolution");
+
+        return id;
+    }
+
+    std::pair<int, int> subdevice_model::get_resolution_from_res_chars_id(const std::vector<const char*>& res_chars, int id_in_res_chars) const
+    {
+        std::string res_str = res_chars[id_in_res_chars];
+        std::pair<int, int> res;
+        auto width_str = res_str.substr(0, res_str.find('x'));
+        auto height_str = res_str.substr(res_str.find('x') + 1, res_str.size());
+        res.first = std::atoi(width_str.c_str());
+        res.second = std::atoi(height_str.c_str());
+
+        return res;
+    }
+
     bool subdevice_model::draw_resolutions_combo_box_multiple_resolutions(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1,
-        int stream_type_id, int depth_res_id)
+        rs2_stream stream_type)
     {
         bool res = false;
-
-        rs2_stream stream_type = RS2_STREAM_DEPTH;
-        if (stream_type_id != depth_res_id)
-            stream_type = RS2_STREAM_INFRARED;
-
 
         auto res_pairs = resolutions_per_stream[stream_type];
         std::vector<std::string> resolutions_str;
@@ -778,9 +932,16 @@ namespace rs2
         }
 
         auto res_chars = get_string_pointers(resolutions_str);
+
+        std::map<const char*, std::pair<int, std::pair<int, int>>> res_char_to_id_and_res;
+        for (int i = 0; i < res_chars.size(); ++i)
+        {
+            res_char_to_id_and_res[res_chars[i]] = std::make_pair(i, res_pairs[i]);
+        }
+        
         if (res_chars.size() > 0)
         {
-            if (!(streaming && !streaming_map[stream_type_id]))
+            if (!(streaming && !streaming_map[stream_type]))
             {
                 // resolution
                 // Draw combo-box with all resolution options for this stream type
@@ -791,62 +952,26 @@ namespace rs2
                 label = rsutils::string::from() << "##" << dev.get_info(RS2_CAMERA_INFO_NAME)
                     << s->get_info(RS2_CAMERA_INFO_NAME) << " resolution for " << rs2_stream_to_string(stream_type);
 
+                int id_in_res_chars = get_res_id_in_resolutions_array(res_chars, ui.selected_stream_to_res[stream_type]);
                 if (!allow_change_resolution_while_streaming && streaming)
                 {
-                    ImGui::Text("%s", res_chars[ui.selected_res_id_map[stream_type_id]]);
+                    ImGui::Text("%s", res_chars[id_in_res_chars]);
                     streaming_tooltip();
                 }
                 else
                 {
-                    ImGui::PushItemWidth(-1);
+                    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 25); // Set the width for the combo box itself with a 25 buffer 
                     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, { 1,1,1,1 });
-                    auto tmp_selected_res_id = ui.selected_res_id_map[stream_type_id];
-                    if (ImGui::Combo(label.c_str(), &tmp_selected_res_id, res_chars.data(),
+                    auto tmp_selected_res = ui.selected_stream_to_res[stream_type];
+
+                    if (RsImGui::CustomComboBox(label.c_str(), &id_in_res_chars, res_chars.data(),
                         static_cast<int>(res_chars.size())))
                     {
                         res = true;
                         _options_invalidated = true;
+                        
+                        ui.selected_stream_to_res[stream_type] = get_resolution_from_res_chars_id(res_chars, id_in_res_chars);
 
-                        // Set sensor mode only at the Viewer app,
-                        // DQT app will handle the sensor mode when the streaming is off (while reseting the stream)
-                        if (s->supports(RS2_OPTION_SENSOR_MODE) && !allow_change_resolution_while_streaming)
-                        {
-                            auto width = res_values[tmp_selected_res_id].first;
-                            auto height = res_values[tmp_selected_res_id].second;
-                            auto res = resolution_from_width_height(width, height);
-                            if (res >= RS2_SENSOR_MODE_VGA && res < RS2_SENSOR_MODE_COUNT)
-                            {
-                                try
-                                {
-                                    s->set_option(RS2_OPTION_SENSOR_MODE, float(res));
-                                }
-                                catch (const error& e)
-                                {
-                                    error_message = error_to_string(e);
-                                }
-
-                                // Only update the cached value once set_option is done! That way, if it doesn't change anything...
-                                try
-                                {
-                                    int sensor_mode_val = static_cast<int>(s->get_option(RS2_OPTION_SENSOR_MODE));
-                                    {
-                                        ui.selected_res_id = get_resolution_id_from_sensor_mode(
-                                            static_cast<rs2_sensor_mode>(sensor_mode_val),
-                                            res_values);
-                                    }
-                                }
-                                catch (...) {}
-                            }
-                            else
-                            {
-                                error_message = rsutils::string::from() << "Resolution " << width << "x" << height
-                                    << " is not supported on this device";
-                            }
-                        }
-                        else
-                        {
-                            ui.selected_res_id_map[stream_type_id] = tmp_selected_res_id;
-                        }
                     }
                     ImGui::PopStyleColor();
                     ImGui::PopItemWidth();
@@ -859,28 +984,18 @@ namespace rs2
         return res;
     }
 
-    bool subdevice_model::draw_formats_combo_box_multiple_resolutions(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1,
-        int stream_type_id)
+    bool subdevice_model::draw_formats_combo_box_multiple_resolutions(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, 
+        float col0, float col1, rs2_stream stream_type)
     {
         bool res = false;
-
-        std::map<rs2_stream, std::vector<int>> stream_to_index;
-        int depth_res_id, ir1_res_id, ir2_res_id;
-        get_depth_ir_mismatch_resolutions_ids(depth_res_id, ir1_res_id, ir2_res_id);
-        stream_to_index[RS2_STREAM_DEPTH] = { depth_res_id };
-        stream_to_index[RS2_STREAM_INFRARED] = { ir1_res_id, ir2_res_id };
-
-        rs2_stream stream_type = RS2_STREAM_DEPTH;
-        if (stream_type_id != depth_res_id)
-            stream_type = RS2_STREAM_INFRARED;
-
 
         for (auto&& f : formats)
         {
             if (f.second.size() == 0)
                 continue;
 
-            if (std::find(stream_to_index[stream_type].begin(), stream_to_index[stream_type].end(), f.first) == stream_to_index[stream_type].end())
+            if (stream_type == RS2_STREAM_DEPTH && f.second[0] != std::string("Z16") ||
+                stream_type == RS2_STREAM_INFRARED && f.second[0] == std::string("Z16"))
                 continue;
 
             auto formats_chars = get_string_pointers(f.second);
@@ -931,9 +1046,9 @@ namespace rs2
                 }
                 else
                 {
-                    ImGui::PushItemWidth(-1);
+                    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 25); // Set the width for the combo box itself with a 25 buffer 
                     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, { 1,1,1,1 });
-                    ImGui::Combo(label.c_str(), &ui.selected_format_id[f.first], formats_chars.data(),
+                    RsImGui::CustomComboBox(label.c_str(), &ui.selected_format_id[f.first], formats_chars.data(),
                         static_cast<int>(formats_chars.size()));
                     ImGui::PopStyleColor();
                     ImGui::PopItemWidth();
@@ -949,26 +1064,19 @@ namespace rs2
     {
         bool res = false;
 
-        if (!ui.is_multiple_resolutions)
-        {
-            return false;
-        }
-
-        int depth_res_id, ir1_res_id, ir2_res_id;
-        get_depth_ir_mismatch_resolutions_ids(depth_res_id, ir1_res_id, ir2_res_id);
-
-        std::vector<uint32_t> stream_types_ids;
-        stream_types_ids.push_back(depth_res_id);
-        stream_types_ids.push_back(ir1_res_id);
-        for (auto&& stream_type_id : stream_types_ids)
+        std::vector<rs2_stream> relevant_streams = { RS2_STREAM_DEPTH, RS2_STREAM_INFRARED };
+        for (auto&& stream_type : relevant_streams)
         {
             // resolution
             // Draw combo-box with all resolution options for this stream type
-            res &= draw_resolutions_combo_box_multiple_resolutions(error_message, label, streaming_tooltip, col0, col1, stream_type_id, depth_res_id);
+            res |= draw_resolutions_combo_box_multiple_resolutions(error_message, label, streaming_tooltip, col0, col1, stream_type);
 
-            // stream and formats
-            // Draw combo-box with all format options for current stream type
-            res &= draw_formats_combo_box_multiple_resolutions(error_message, label, streaming_tooltip, col0, col1, stream_type_id);
+            if (draw_streams_selector) 
+            {
+                // stream and formats
+                // Draw combo-box with all format options for current stream type
+                res |= draw_formats_combo_box_multiple_resolutions(error_message, label, streaming_tooltip, col0, col1, stream_type);
+            }
         }
 
         return res;
@@ -976,6 +1084,7 @@ namespace rs2
     // The function returns true if one of the configuration parameters changed
     bool subdevice_model::draw_stream_selection(std::string& error_message)
     {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10);
         bool res = false;
 
         std::string label = rsutils::string::from()
@@ -985,28 +1094,25 @@ namespace rs2
         auto streaming_tooltip = [&]() {
             if ((!allow_change_resolution_while_streaming && streaming)
                 && ImGui::IsItemHovered())
-                ImGui::SetTooltip("Can't modify while streaming");
+                RsImGui::CustomTooltip("Can't modify while streaming");
         };
 
         auto col0 = ImGui::GetCursorPosX();
         auto col1 = 9.f * (float)config_file::instance().get( configurations::window::font_size );
 
-        if (ui.is_multiple_resolutions && !strcmp(s->get_info(RS2_CAMERA_INFO_NAME), "Stereo Module"))
+        if (ui.is_multiple_resolutions)
         {
             if (draw_fps_selector)
             {
                 res |= draw_fps(error_message, label, streaming_tooltip, col0, col1);
             }
 
-            if (draw_streams_selector)
+            if (!streaming)
             {
-                if (!streaming)
-                {
-                    ImGui::Text("Available Streams:");
-                }
-
-                res |= draw_res_stream_formats(error_message, label, streaming_tooltip, col0, col1);
+                ImGui::Text("Available Streams:");
             }
+
+            res |= draw_res_stream_formats(error_message, label, streaming_tooltip, col0, col1);
         }
         else
         {
@@ -1075,13 +1181,13 @@ namespace rs2
             }
             else
             {
-                auto res_vec = profile_id_to_res[p.unique_id()];
+                auto res_vec = resolutions_per_stream[p.stream_type()];
                 for (int i = 0; i < res_vec.size(); i++)
                 {
                     if (auto vid_prof = p.as<video_stream_profile>())
                         if (res_vec[i].first == vid_prof.width() && res_vec[i].second == vid_prof.height())
                         {
-                            ui.selected_res_id_map[p.unique_id()] = i;
+                            ui.selected_stream_to_res[p.stream_type()] = res_vec[i];
                             break;
                         }
                 }
@@ -1148,9 +1254,9 @@ namespace rs2
         }
         else
         {
-            for (auto it = profile_id_to_res.begin(); it != profile_id_to_res.end(); ++it)
+            for (auto it = resolutions_per_stream.begin(); it != resolutions_per_stream.end(); ++it)
             {
-                selected_resolutions.push_back(it->second[ui.selected_res_id_map[it->first]]);
+                selected_resolutions.push_back(ui.selected_stream_to_res[it->first]);
             }
         }
         std::sort(profiles.begin(), profiles.end(), [&](stream_profile a, stream_profile b) {
@@ -1220,9 +1326,9 @@ namespace rs2
         }
         else
         {
-            for (auto it = profile_id_to_res.begin(); it != profile_id_to_res.end(); ++it)
+            for (auto it = resolutions_per_stream.begin(); it != resolutions_per_stream.end(); ++it)
             {
-                selected_resolutions.push_back(it->second[ui.selected_res_id_map[it->first]]);
+                selected_resolutions.push_back(ui.selected_stream_to_res[it->first]);
             }
         }
 
@@ -1240,7 +1346,7 @@ namespace rs2
                     break;
             }
         }
-        else if (ui.is_multiple_resolutions && (ui.selected_res_id_map != last_valid_ui.selected_res_id_map))
+        else if (ui.is_multiple_resolutions && (ui.selected_stream_to_res != last_valid_ui.selected_stream_to_res))
         {
             get_sorted_profiles(sorted_profiles);
             std::map<int, std::map<int, stream_profile>> profiles_by_fps;
@@ -1418,6 +1524,56 @@ namespace rs2
         return is_cal_format;
     }
 
+    bool subdevice_model::is_depth_calibration_profile() const
+    {
+        // Check if D555 at depth resolution of 1280x800
+        std::string dev_name = "";
+        if( dev.supports( RS2_CAMERA_INFO_NAME ) )
+            dev_name = dev.get_info( RS2_CAMERA_INFO_NAME );
+
+        if( dev_name.find( "D555" ) != std::string::npos )
+        {
+            // More efficient to check resolution before format
+            if( ui.selected_res_id > 0 && res_values.size() > ui.selected_res_id &&  // Verify res_values is initialized
+                res_values[ui.selected_res_id].first == 1280 && res_values[ui.selected_res_id].second == 800 )
+            {
+                for( auto it = stream_enabled.begin(); it != stream_enabled.end(); ++it )
+                {
+                    if( it->second )
+                    {
+                        int selected_format_index = -1;
+                        if( ui.selected_format_id.count( it->first ) > 0 )
+                            selected_format_index = ui.selected_format_id.at( it->first );
+
+                        if( format_values.count( it->first ) > 0 && selected_format_index > -1 )
+                        {
+                            auto formats = format_values.at( it->first );
+                            if( formats.size() > selected_format_index )
+                            {
+                                auto format = formats[selected_format_index];
+                                if( format == RS2_FORMAT_Z16 )
+                                    return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool subdevice_model::is_multiple_resolutions_supported() const
+    {
+        if( !dev.supports( RS2_CAMERA_INFO_PRODUCT_LINE ) || !s->supports( RS2_CAMERA_INFO_NAME ) )
+            return false;
+
+        std::string product_line = dev.get_info( RS2_CAMERA_INFO_PRODUCT_LINE );
+        std::string sensor_name = s->get_info( RS2_CAMERA_INFO_NAME );
+
+        return product_line == "D500" && sensor_name == "Stereo Module";
+    }
+
     std::pair<int, int> subdevice_model::get_max_resolution(rs2_stream stream) const
     {
         if (resolutions_per_stream.count(stream) > 0)
@@ -1429,6 +1585,25 @@ namespace rs2
         error_message << " is not available with this sensor ";
         error_message << s->get_info(RS2_CAMERA_INFO_NAME);
         throw std::runtime_error(error_message.str());
+    }
+
+    void subdevice_model::select_resolution( int width, int height, rs2_stream stream )
+    {
+        if( ui.is_multiple_resolutions )
+        {
+            // (0, 0) indicates keep current resolution
+            if( width != 0 && height != 0 && stream != RS2_STREAM_ANY )
+                ui.selected_stream_to_res[stream] = { width, height };
+        }
+        else
+        {
+            for( int i = 0; i < res_values.size(); i++ )
+            {
+                auto kvp = res_values[i];
+                if( kvp.first == width && kvp.second == height )
+                    ui.selected_res_id = i;
+            }
+        }
     }
 
     std::vector<stream_profile> subdevice_model::get_selected_profiles(bool enforce_inter_stream_policies)
@@ -1461,7 +1636,7 @@ namespace rs2
                         {
                             int width = 0;
                             int height = 0;
-                            std::vector<std::pair<int, int>> selected_resolutions;
+                            std::map<rs2_stream, std::pair<int, int>> stream_to_selected_resolution;
                             if (!ui.is_multiple_resolutions)
                             {
                                 width = res_values[ui.selected_res_id].first;
@@ -1472,12 +1647,11 @@ namespace rs2
                             }
                             else
                             {
-                                for (auto it = profile_id_to_res.begin(); it != profile_id_to_res.end(); ++it)
-                                {
-                                    selected_resolutions.push_back(it->second[ui.selected_res_id_map[it->first]]);
-                                }
+                                stream_to_selected_resolution[p.stream_type()] = ui.selected_stream_to_res[p.stream_type()];
+  
                                 error_message << "\n{" << stream_display_names[stream] << ","
-                                    << selected_resolutions[0].first << "x" << selected_resolutions[0].second << " at " << fps << "Hz, "
+                                    << stream_to_selected_resolution[p.stream_type()].first << "x" 
+                                    << stream_to_selected_resolution[p.stream_type()].second << " at " << fps << "Hz, "
                                     << rs2_format_to_string(format) << "} ";
                             }
 
@@ -1501,10 +1675,7 @@ namespace rs2
                                     else
                                     {
                                         std::pair<int, int> cur_res;
-                                        if (p.stream_type() == RS2_STREAM_DEPTH)
-                                            cur_res = selected_resolutions[0];
-                                        else
-                                            cur_res = selected_resolutions[1];
+                                        cur_res = stream_to_selected_resolution[p.stream_type()];
                                         if (vid_prof.width() == cur_res.first && vid_prof.height() == cur_res.second)
                                             results.push_back(p);
                                     }
@@ -1533,21 +1704,39 @@ namespace rs2
         return results;
     }
 
+    // Move-and-wait pattern: the first caller that enters takes ownership of the
+    // future via std::move, so a concurrent second caller sees an invalid future
+    // and returns immediately.  All current call sites (destructor, play(),
+    // fw-update) are mutually exclusive flows, so at most one thread waits on
+    // the background stop at any given time.
+    //
+    // NOTE: exceptions from the background stop propagate through the future
+    // and are re-thrown here.  Callers that must not throw (e.g. destructor)
+    // are responsible for their own try/catch around this call.
+    void subdevice_model::wait_for_stop()
+    {
+        std::future< void > local;
+        {
+            std::lock_guard< std::mutex > lock(_stop_mutex);
+            local = std::move(_stop_future);
+        }
+        if (local.valid())
+            local.get();
+    }
+
     void subdevice_model::stop(std::shared_ptr<notifications_model> not_model)
     {
         if (not_model)
             not_model->add_log("Stopping streaming");
 
+        // --- Immediate UI state (synchronous) ---
         streaming = false;
         _pause = false;
 
         if (ui.is_multiple_resolutions)
         {
-            int depth_res_id, ir1_res_id, ir2_res_id;
-            get_depth_ir_mismatch_resolutions_ids(depth_res_id, ir1_res_id, ir2_res_id);
-            streaming_map[depth_res_id] = false;
-            streaming_map[ir1_res_id] = false;
-            streaming_map[ir2_res_id] = false;
+            streaming_map[RS2_STREAM_DEPTH] = false;
+            streaming_map[RS2_STREAM_INFRARED] = false;
         }
 
         if (profiles[0].stream_type() == RS2_STREAM_COLOR)
@@ -1561,17 +1750,31 @@ namespace rs2
             viewer.disable_measurements();
         }
 
-        s->stop();
+        // --- Heavy operations (background) ---
+        // Chain with any prior pending stop without blocking the caller:
+        // move the old future into the lambda so it waits internally.
+        std::lock_guard< std::mutex > lock(_stop_mutex);
+        auto prev_stop = std::move(_stop_future);
 
-        _options_invalidated = true;
-
-        queues.foreach([&](frame_queue& q)
+        auto sensor_ptr = s;
+        _stop_future = std::async(std::launch::async, [this, sensor_ptr, prev_stop = std::move(prev_stop)]() mutable
             {
-                frame f;
-                while (q.poll_for_frame(&f));
-            });
+                if (prev_stop.valid())
+                    prev_stop.get();
 
-        s->close();
+                sensor_ptr->stop();
+
+                queues.foreach([&](frame_queue& q)
+                    {
+                        frame f;
+                        while (q.poll_for_frame(&f));
+                    });
+
+                sensor_ptr->close();
+
+                // Invalidate after close() so options whose read-only depends on is_opened() refresh correctly.
+                _options_invalidated = true;
+            });
     }
 
     bool subdevice_model::is_paused() const
@@ -1582,11 +1785,21 @@ namespace rs2
     void subdevice_model::pause()
     {
         _pause = true;
+        auto playback_dev = dev.as<rs2::playback>();
+        if (playback_dev && playback_dev.current_status() == RS2_PLAYBACK_STATUS_PLAYING)
+        {
+            playback_dev.pause();
+        }
     }
 
     void subdevice_model::resume()
     {
         _pause = false;
+        auto playback_dev = dev.as<rs2::playback>();
+        if (playback_dev && playback_dev.current_status() == RS2_PLAYBACK_STATUS_PAUSED)
+        {
+            playback_dev.resume();
+        }
     }
 
     //The function decides if specific frame should be sent to the syncer
@@ -1598,8 +1811,55 @@ namespace rs2
         return false;
     }
 
+    void subdevice_model::avoid_streaming_on_embedded_filters_not_matching_configuration() const
+    {
+        // check if sensor is depth
+        // check if embedded decimation filter is ON
+        // check if reolution is different from 640 X 360
+        if (s->is<depth_sensor>())
+            {
+            auto current_depth_sensor = s->as<depth_sensor>();
+
+            std::shared_ptr<embedded_filter_model> embedded_decimation = nullptr;
+            for (auto& ef : embedded_filters)
+            {
+                if (ef->get_filter()->get_type() == RS2_EMBEDDED_FILTER_TYPE_DECIMATION)
+                {
+                    embedded_decimation = ef;
+                    break;
+                }
+            }
+            if (embedded_decimation &&
+                embedded_decimation->get_filter()->get_option(RS2_OPTION_EMBEDDED_FILTER_ENABLED))
+            {
+                // check if resolution is different from 640 X 360
+                int width = 0;
+                int height = 0;
+                if (!ui.is_multiple_resolutions)
+                {
+                    width = res_values[ui.selected_res_id].first;
+                    height = res_values[ui.selected_res_id].second;
+                }
+                else
+                {
+                    auto res_pair = ui.selected_stream_to_res.at(RS2_STREAM_DEPTH);
+                    width = res_pair.first;
+                    height = res_pair.second;
+                }
+                if (width != 640 || height != 360)
+                {
+                    throw std::runtime_error("Cannot start streaming: Embedded Decimation filter to be used only with resolution 640x360.");
+                }
+            }
+        }
+    }
+
     void subdevice_model::play(const std::vector<stream_profile>& profiles, viewer_model& viewer, std::shared_ptr<rs2::asynchronous_syncer> syncer)
     {
+        wait_for_stop();
+        avoid_streaming_on_embedded_filters_not_matching_configuration();
+        set_extrinsics_from_depth_if_needed();
+
         std::stringstream ss;
         ss << "Starting streaming of ";
         for (size_t i = 0; i < profiles.size(); i++)
@@ -1640,11 +1900,10 @@ namespace rs2
 
         if (ui.is_multiple_resolutions)
         {
-            int depth_res_id, ir1_res_id, ir2_res_id;
-            get_depth_ir_mismatch_resolutions_ids(depth_res_id, ir1_res_id, ir2_res_id);
-            streaming_map[depth_res_id] = true;
-            streaming_map[ir1_res_id] = true;
-            streaming_map[ir2_res_id] = true;
+            for (size_t i = 0; i < profiles.size(); i++)
+            {
+                streaming_map[profiles[i].stream_type()] = true;
+            }
         }
 
         if (s->is< color_sensor >())
@@ -1655,30 +1914,56 @@ namespace rs2
     }
     void subdevice_model::update(std::string& error_message, notifications_model& notifications)
     {
-        if (_options_invalidated)
+        // Two paths below are throttled while the user is actively writing options
+        // (last_user_set_stopwatch < 500 ms):
+        //   - the _options_invalidated branch posts a JSON-config save job, which is
+        //     fine to skip during a drag (the worker coalesces anyway).
+        //   - the per-frame get_option_value() polling shares the per-device USB bus
+        //     with our async option-write worker and with options_watcher's 1 s poll
+        //     cycle, so polling here would reintroduce the UI freeze the async dispatch
+        //     is meant to fix.
+        // The gate is scoped to just these two paths so that any other logic added to
+        // update() in the future (or below this point) is not silently throttled.
+        // `value` stays fresh during the gate via options_watcher -> on_options_changed.
+        const bool user_writing = last_user_set_stopwatch.get_elapsed_ms() < 500;
+
+        if (!user_writing && _options_invalidated)
         {
             next_option = 0;
             _options_invalidated = false;
 
-            save_processing_block_to_config_file("colorizer", depth_colorizer);
-            save_processing_block_to_config_file("yuy2rgb", yuy2rgb);
-            save_processing_block_to_config_file("y411", y411);
-
-            for (auto&& pbm : post_processing) pbm->save_to_config_file();
+            // Capture by value so the worker stays UAF-safe even if `this` dies mid-save.
+            // shared_ptrs keep the underlying processing blocks alive until the job runs.
+            auto colorizer = depth_colorizer;
+            auto yuy2      = yuy2rgb;
+            auto m420      = m420_to_rgb;
+            auto nv12      = nv12_to_rgb;
+            auto y411_ptr  = y411;
+            auto pp        = post_processing;
+            config_save_worker::instance().post( this,
+                [ colorizer, yuy2, m420, nv12, y411_ptr, pp ]
+                {
+                    save_processing_block_to_config_file( "colorizer",   colorizer );
+                    save_processing_block_to_config_file( "yuy2rgb",     yuy2 );
+                    save_processing_block_to_config_file( "m420_to_rgb", m420 );
+                    save_processing_block_to_config_file( "nv12_to_rgb", nv12 );
+                    save_processing_block_to_config_file( "y411",        y411_ptr );
+                    for( auto & pbm : pp ) pbm->save_to_config_file();
+                } );
         }
 
-        if (next_option < supported_options.size())
+        if (!user_writing && next_option < supported_options.size())
         {
             auto next = supported_options[next_option];
             if (options_metadata.find(static_cast<rs2_option>(next)) != options_metadata.end())
             {
-                auto& opt_md = options_metadata[static_cast<rs2_option>(next)];
+                auto& opt_md = options_metadata.at(static_cast<rs2_option>(next));
                 opt_md.update_all_fields(error_message, notifications);
 
                 if (next == RS2_OPTION_ENABLE_AUTO_EXPOSURE)
                 {
                     auto old_ae_enabled = auto_exposure_enabled;
-                    auto_exposure_enabled = opt_md.value->as_float > 0;
+                    auto_exposure_enabled = opt_md.value_as_float() > 0;
 
                     if (!old_ae_enabled && auto_exposure_enabled)
                     {
@@ -1702,11 +1987,11 @@ namespace rs2
 
                 if (next == RS2_OPTION_DEPTH_UNITS)
                 {
-                    opt_md.dev->depth_units = opt_md.value->as_float;
+                    opt_md.dev->depth_units = opt_md.value_as_float();
                 }
 
                 if (next == RS2_OPTION_STEREO_BASELINE)
-                    opt_md.dev->stereo_baseline = opt_md.value->as_float;
+                    opt_md.dev->stereo_baseline = opt_md.value_as_float();
             }
 
             next_option++;
@@ -1745,31 +2030,69 @@ namespace rs2
     {
         bool is_d400 = s->supports(RS2_CAMERA_INFO_PRODUCT_LINE) ?
             std::string(s->get_info(RS2_CAMERA_INFO_PRODUCT_LINE)) == "D400" : false;
-
         std::string fw_version = s->supports(RS2_CAMERA_INFO_FIRMWARE_VERSION) ?
             s->get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION) : "";
-
         bool supported_fw = s->supports(RS2_CAMERA_INFO_FIRMWARE_VERSION) ?
             is_upgradeable("05.11.12.0", fw_version) : false;
+        bool d400_on_chip_calib_supported = s->is<rs2::depth_sensor>() && is_d400 && supported_fw;
 
-        return s->is<rs2::depth_sensor>() && is_d400 && supported_fw;
-        // TODO: Once auto-calib makes it into the API, switch to querying camera info
+        bool is_d500 = s->supports(RS2_CAMERA_INFO_PRODUCT_LINE) ?
+            std::string(s->get_info(RS2_CAMERA_INFO_PRODUCT_LINE)) == "D500" : false;
+        bool is_depth_sensor = s->supports(RS2_CAMERA_INFO_NAME) ?
+            std::string(s->get_info(RS2_CAMERA_INFO_NAME)) == "Stereo Module" : false;
+        bool d500_on_chip_calib_supported = is_depth_sensor && is_d500;
+
+        return d400_on_chip_calib_supported || d500_on_chip_calib_supported;
     }
 
-    void subdevice_model::get_depth_ir_mismatch_resolutions_ids(int& depth_res_id, int& ir1_res_id, int& ir2_res_id) const
+    void subdevice_model::set_extrinsics_from_depth_if_needed()
     {
-        auto it = profile_id_to_res.begin();
-        if (it != profile_id_to_res.end())
+        std::string pid = dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
+        std::string sensor_name = s->get_info(RS2_CAMERA_INFO_NAME);
+        if (pid == "0B6B" && sensor_name == "Depth Mapping Camera")
         {
-            depth_res_id = it->first;
-            if (++it != profile_id_to_res.end())
+            //_labeled_point_cloud_to_depth_extrinsics
+            stream_profile depth_profile;
+
+            auto depth_sensor = dev.first<rs2::depth_sensor>();
+            auto profiles = depth_sensor.get_stream_profiles();
+            for (auto&& p : profiles)
             {
-                ir1_res_id = it->first;
-                if (++it != profile_id_to_res.end())
+                if (p.stream_type() == RS2_STREAM_DEPTH)
                 {
-                    ir2_res_id = it->first;
+                    depth_profile = p;
+                    break;
                 }
             }
+            stream_profile lpc_profile;
+            profiles = s->get_stream_profiles();
+            for (auto&& p : profiles)
+            {
+                if (p.stream_type() == RS2_STREAM_LABELED_POINT_CLOUD)
+                {
+                    lpc_profile = p;
+                    break;
+                }
+            }
+            if (depth_profile && lpc_profile)
+                _extrinsics_from_depth = depth_profile.get_extrinsics_to(lpc_profile);
         }
+    }
+
+    bool subdevice_model::hide_resolutions(const stream_profile& profile) const
+    {
+        if (s->supports(RS2_CAMERA_INFO_NAME) &&
+            s->get_info(RS2_CAMERA_INFO_NAME) == std::string("Depth Mapping Camera"))
+        {
+            if (auto vid_prof = profile.as<video_stream_profile>())
+            {
+                int width = vid_prof.width();
+                int height = vid_prof.height();
+
+                if ((width == 2880 && height == 32) || (width == 128 && height == 128))
+                    return true;
+            }
+        }
+        return false;
     }
 }

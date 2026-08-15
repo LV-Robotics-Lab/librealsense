@@ -1,5 +1,5 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -57,6 +57,29 @@ namespace librealsense
                 {
                     return pb;
                 } );
+        }
+
+        // Overload taking explicit target stream_profiles. Each target carries its own stream and
+        // index (and is future-ready for more profile fields), for converters whose output is not on
+        // the default stream index. Kept as a single 2-arg form so a braced rs2_format list still
+        // resolves unambiguously to the vector<rs2_format> overloads above.
+        template<typename T>
+        static std::vector<processing_block_factory> create_pbf_vector( rs2_format src, const std::vector<stream_profile>& dst )
+        {
+            std::vector<processing_block_factory> rgb_factories;
+            for( auto const & target : dst )
+            {
+                // register identity processing block if requested
+                if( src == target.format )
+                {
+                    rgb_factories.push_back( { { {src} }, { target }, []() { return std::make_shared<identity_processing_block>(); } } );
+                    continue;
+                }
+
+                rgb_factories.push_back( { { {src} }, { target }, [=]() { return std::make_shared<T>( target.format ); } } );
+            }
+
+            return rgb_factories;
         }
 
         stream_profiles find_satisfied_requests(const stream_profiles& sp, const stream_profiles& supported_profiles) const;

@@ -1,7 +1,7 @@
 #!python3
 
 # License: Apache 2.0. See LICENSE file in root directory.
-# Copyright(c) 2021 Intel Corporation. All Rights Reserved.
+# Copyright(c) 2021 RealSense, Inc. All Rights Reserved.
 
 import sys, os, subprocess, re, platform, getopt, time
 
@@ -9,18 +9,12 @@ import sys, os, subprocess, re, platform, getopt, time
 current_dir = os.path.dirname( os.path.abspath( __file__ ) )
 sys.path.append( os.path.join( current_dir, 'py' ))
 
-from rspy import log, file, repo, libci
+from rspy import log, file, repo, libci, python_path, fw_compat
+from rspy.signals import register_signal_handlers
 
-# Python's default list of paths to look for modules includes user-intalled. We want
-# to avoid those to take only the pyrealsense2 we actually compiled!
-#
-# Rather than rebuilding the whole sys.path, we instead remove:
-from site import getusersitepackages   # not the other stuff, like quit(), exit(), etc.!
-#log.d( 'site packages=', getusersitepackages() )
-#log.d( 'sys.path=', sys.path )
-#log.d( 'removing', [p for p in sys.path if file.is_inside( p, getusersitepackages() )])
-sys.path = [p for p in sys.path if not file.is_inside( p, getusersitepackages() )]
-#log.d( 'modified=', sys.path )
+# Make sure the freshly-built pyrealsense2/pyrealdds/pyrsutils win over any copy
+# pip may have left in the user site (~/.local/...).
+python_path.block_user_site_for( { 'pyrealsense2', 'pyrealdds', 'pyrsutils' } )
 
 
 def usage():
@@ -33,6 +27,7 @@ def usage():
     print( '        -q, --quiet          Suppress output; rely on exit status (0=no failures)' )
     print( '        -s, --stdout         Do not redirect stdout to logs' )
     print( '        -r, --regex          Run all tests whose name matches the following regular expression' )
+    print( '        --skip-regex         Skip all tests whose name matches the following regular expression' )
     print( '        -t, --tag            Run all tests with the following tag. If used multiple times runs all tests matching' )
     print( '                             all tags. e.g. -t tag1 -t tag2 will run tests who have both tag1 and tag2' )
     print( '                             tests automatically get tagged with \'exe\' or \'py\' and based on their location' )
@@ -46,12 +41,20 @@ def usage():
     print( '        --no-exceptions      Do not load the LibCI/exceptions.specs file' )
     print( '        --context <>         The context to use for test configuration' )
     print( '        --repeat <#>         Repeat each test <#> times' )
+    print( '        --retry <#>          Retry each test <#> times (unless test specified more)' )
     print( '        --config <>          Ignore test configurations; use the one provided' )
-    print( '        --device <>          Run only on the specified devices; ignore any test that does not match (implies --live)' )
+    print( '        --device <>          Run only on the specified devices; ignore any test that does not match (implies --live).' )
+    print( '                             Can be repeated or given a space-separated list, e.g. --device "D455 D435".' )
+    print( '        --exclude-device <>  Exclude the specified devices from testing.' )
+    print( '                             Can be repeated or given a space-separated list, e.g. --exclude-device "D555 D585S".' )
     print( '        --no-reset           Do not try to reset any devices, with or without a hub' )
     print( '        --hub-reset          If a hub is available, reset the hub itself' )
+    print( '        --custom-fw-d400          If custom fw provided flash it if its different that the current fw installed' )
+    print( '        --custom-fw-d555          If custom fw provided flash it if its different that the current fw installed' )
     print( '        --rslog              Enable LibRS logging (LOG_DEBUG etc.) to console in each test' )
     print( '        --skip-disconnected  Skip live test if required device is disconnected (only applies w/o a hub)' )
+    print( '        --test-dir <>        Restrict discovery to tests under this dir or file (repeatable);' )
+    print( '                             ex: --test-dir live/image-quality --test-dir test-fw-update.py' )
     print( 'Examples:' )
     print( 'Running: python run-unit-tests.py -s' )
     print( '    Runs all tests, but direct their output to the console rather than log files' )
@@ -63,8 +66,7 @@ def usage():
     print( "    exe files in the provided directory. Each test will create its own .log file to which its" )
     print( "    output will be written." )
     sys.exit( 2 )
-
-
+    
 # get os and directories for future use
 # NOTE: WSL will read as 'Linux' but the build is Windows-based!
 system = platform.system()
@@ -77,8 +79,8 @@ else:
 try:
     opts, args = getopt.getopt( sys.argv[1:], 'hvqr:st:',
                                 longopts=['help', 'verbose', 'debug', 'quiet', 'regex=', 'stdout', 'tag=', 'list-tags',
-                                          'list-tests', 'no-exceptions', 'context=', 'repeat=', 'config=', 'no-reset', 'hub-reset',
-                                          'rslog', 'skip-disconnected', 'live', 'not-live', 'device='] )
+                                          'list-tests', 'no-exceptions', 'context=', 'repeat=', 'retry=', 'config=', 'no-reset', 'hub-reset',
+                                          'rslog', 'skip-disconnected', 'live', 'not-live', 'device=', 'exclude-device=', 'test-dir=','skip-regex=','custom-fw-d400=','custom-fw-d555='] )
 except getopt.GetoptError as err:
     log.e( err )  # something like "option -a not recognized"
     usage()
@@ -90,14 +92,20 @@ list_tests = False
 no_exceptions = False
 context = []
 repeat = 1
+retries = 0
 forced_configurations = None
 device_set = None
+exclude_device_set = None
 no_reset = False
 hub_reset = False
 skip_disconnected = False
+custom_fw_path=''
+custom_fw_d555_path=''
 rslog = False
 only_live = False
 only_not_live = False
+test_dirs = []  # accumulator for --test-dir values; defaults to [current_dir] after parsing
+skip_regex = None
 for opt, arg in opts:
     if opt in ('-h', '--help'):
         usage()
@@ -124,6 +132,11 @@ for opt, arg in opts:
             log.e( "--repeat must be a number greater than 0" )
             usage()
         repeat = int(arg)
+    elif opt == '--retry':
+        if not arg.isnumeric()  or  int(arg) < 0:
+            log.e( "--retry must be a number greater than or equal to 0" )
+            usage()
+        retries = int(arg)
     elif opt == '--config':
         forced_configurations = [[arg]]
     elif opt == '--device':
@@ -131,7 +144,13 @@ for opt, arg in opts:
             log.e( "--device and --not-live are mutually exclusive" )
             usage()
         only_live = True
-        device_set = arg.split()
+        if device_set is None:
+            device_set = []
+        device_set.extend( arg.split() )
+    elif opt == '--exclude-device':
+        if exclude_device_set is None:
+            exclude_device_set = []
+        exclude_device_set.extend( arg.split() )
     elif opt == '--no-reset':
         no_reset = True
     elif opt == '--hub-reset':
@@ -150,6 +169,21 @@ for opt, arg in opts:
             log.e( "--live and --not-live are mutually exclusive" )
             usage()
         only_not_live = True
+    elif opt == '--test-dir':
+        test_dirs.append( os.path.abspath(arg) )
+        log.i(f'Restricting tests to: {test_dirs[-1]}')
+    elif opt in ('--skip-regex'):
+        skip_regex = arg
+    elif opt == '--custom-fw-d400':
+        custom_fw_path = arg  # Store the custom firmware path
+        log.i(f"custom D400 firmware path was provided ${custom_fw_path}")
+    elif opt == '--custom-fw-d555':
+        custom_fw_d555_path = arg  # Store the custom D555 firmware path
+        log.i(f"custom D555 firmware path was provided ${custom_fw_d555_path}")
+
+if not test_dirs:
+    test_dirs = [current_dir]
+
 
 def find_build_dir( dir ):
     """
@@ -233,7 +267,9 @@ if not to_stdout:
     logdir = os.path.join( exe_dir or build_dir or os.path.join( repo.root, 'build' ), 'unit-tests' )
     os.makedirs( logdir, exist_ok=True )
     libci.logdir = logdir
+        
 n_tests = 0
+n_failed_tests = 0
 
 # Figure out which sys.path we want the tests to see, assuming we have Python tests
 # PYTHONPATH is what Python will ADD to sys.path for child processes BEFORE any standard python paths
@@ -261,7 +297,7 @@ def configuration_str( configuration, repetition=0, retry=0, sns=None, prefix=''
     elif sns is not None:
         s += '[' + serial_numbers_to_string( sns ) + ']'
     if repetition:
-        s += '[' + str(repetition+1) + ']'
+        s += f'[rep {repetition+1}]'
     if retry:
         s += f'[retry {retry}]'
     if s:
@@ -280,7 +316,7 @@ def check_log_for_fails( path_to_log, testname, configuration=None, repetition=1
     if path_to_log is None:
         return False
     results = None
-    for ctx in file.grep( r'^test cases:\s*(\d+) \|\s*(\d+) (passed|failed)|^----------TEST-SEPARATOR----------$',
+    for ctx in file.grep( r'test cases:\s*(\d+) \|\s*(\d+) (passed|failed)|^----------TEST-SEPARATOR----------$',
                           path_to_log ):
         m = ctx['match']
         if m.string == "----------TEST-SEPARATOR----------":
@@ -316,9 +352,16 @@ def check_log_for_fails( path_to_log, testname, configuration=None, repetition=1
 
 
 def get_tests():
-    global regex, build_dir, exe_dir, pyrs, current_dir, linux, context, list_only
+    global regex, build_dir, exe_dir, pyrs, linux, context, list_only, skip_regex, current_dir, test_dirs
     if regex:
-        pattern = re.compile( regex )
+        run_pattern = re.compile( regex )
+
+    if skip_regex:
+        skip_pattern = re.compile( skip_regex )
+
+    def in_test_dirs( script_abspath ):
+        return any( script_abspath.startswith( p ) for p in test_dirs )
+
     # In Linux, the build targets are located elsewhere than on Windows
     # Go over all the tests from a "manifest" we take from the result of the last CMake
     # run (rather than, for example, looking for test-* in the build-directory):
@@ -329,6 +372,8 @@ def get_tests():
             # We need to first create the test name so we can see if it fits the regex
             testdir = manifest_ctx['match'].group( 0 )  # "log/internal/test-all"
             # log.d( testdir )
+            if not in_test_dirs( os.path.join( current_dir, testdir ) ):
+                continue
             testparent = os.path.dirname( testdir )  # "log/internal"
             if testparent:
                 testname = 'test-' + testparent.replace( '/', '-' ) + '-' + os.path.basename( testdir )[
@@ -336,7 +381,10 @@ def get_tests():
             else:
                 testname = testdir  # no parent folder so we get "test-all"
 
-            if regex and not pattern.search( testname ):
+            if regex and not run_pattern.search( testname ):
+                continue
+            
+            if skip_regex and skip_pattern.search( testname ):
                 continue
 
             exe = os.path.join( exe_dir, testname )
@@ -350,7 +398,9 @@ def get_tests():
     elif list_only:
         # We want to list all tests, even if they weren't built.
         # So we look for the source files instead of using the manifest
-        for cpp_test in file.find( current_dir, '(^|/)test-.*\.cpp' ):
+        for cpp_test in file.find( current_dir, r'(^|/)test-.*\.cpp' ):
+            if not in_test_dirs( os.path.join( current_dir, cpp_test ) ):
+                continue
             testparent = os.path.dirname( cpp_test )  # "log/internal" <-  "log/internal/test-all.py"
             if testparent:
                 testname = 'test-' + testparent.replace( '/', '-' ) + '-' + os.path.basename( cpp_test )[
@@ -358,21 +408,29 @@ def get_tests():
             else:
                 testname = os.path.basename( cpp_test )[:-4]
 
-            if regex and not pattern.search( testname ):
+            if regex and not run_pattern.search( testname ):
+                continue
+
+            if skip_regex and skip_pattern.search( testname ):
                 continue
 
             yield libci.ExeTest( testname, context = context )
 
     # Python unit-test scripts are in the same directory as us... we want to consider running them
     # (we may not if they're live and we have no pyrealsense2.pyd):
-    for py_test in file.find( current_dir, '(^|/)test-.*\.py' ):
+    for py_test in file.find( current_dir, r'(^|/)test-.*\.py' ):
+        if not in_test_dirs( os.path.join( current_dir, py_test ) ):
+            continue
         testparent = os.path.dirname( py_test )  # "log/internal" <-  "log/internal/test-all.py"
         if testparent:
             testname = 'test-' + testparent.replace( '/', '-' ) + '-' + os.path.basename( py_test )[5:-3]  # remove .py
         else:
             testname = os.path.basename( py_test )[:-3]
 
-        if regex and not pattern.search( testname ):
+        if regex and not run_pattern.search( testname ):
+            continue
+
+        if skip_regex and skip_pattern.search( testname ):
             continue
 
         yield libci.PyTest( testname, py_test, context )
@@ -408,18 +466,35 @@ def devices_by_test_config( test, exceptions ):
             continue
 
 
-def test_wrapper_( test, configuration=None, repetition=1, retry=0, sns=None ):
+def test_wrapper_( test, configuration=None, repetition=1, curr_retry=0, max_retry = 0, sns=None, custom_fw_d400_override=None ):
     global rslog
     #
     if not log.is_debug_on():
-        conf_str = configuration_str( configuration, repetition, retry=retry, prefix='  ', sns=sns )
+        conf_str = configuration_str( configuration, repetition, retry=curr_retry, prefix='  ', sns=sns )
         log.i( f'Running {test.name}{conf_str}' )
     #
     log_path = test.get_log()
     #
-    opts = set()
+    opts = []
     if rslog:
-        opts.add( '--rslog' )
+        opts.append( '--rslog' )
+    # custom_fw_d400_override comes from the FW-compat gate below (rspy.fw_compat): when
+    # the bundled FW (or a user-supplied --custom-fw-d400) is below the device's minimum
+    # supported FW, the gate swaps in a per-device fallback image listed in
+    # rspy/fw_fallback.json so test-fw-update can still exercise the flash path. The
+    # override wins over --custom-fw-d400. Only D400 has both a populated min-FW map and
+    # a fallback entry today; adding D555/D585S would require a D5xx override of
+    # get_firmware_min_version() and a parallel --custom-fw-d555 override pipe.
+    effective_custom_fw_d400 = custom_fw_d400_override or custom_fw_path
+    if test.name == "test-fw-update" and effective_custom_fw_d400:
+        opts.append('--custom-fw-d400')
+        opts.append(effective_custom_fw_d400)
+    if test.name == "test-fw-update" and custom_fw_d555_path:
+        opts.append('--custom-fw-d555')
+        opts.append(custom_fw_d555_path)
+    if test.name == 'test-fw-update' and sns and len( sns ) == 1:
+        opts.append( '--serial' )
+        opts.append( next( iter( sns ) ) )
     try:
         test.run_test( configuration = configuration, log_path = log_path, opts = opts )
     except FileNotFoundError as e:
@@ -427,26 +502,51 @@ def test_wrapper_( test, configuration=None, repetition=1, retry=0, sns=None ):
     except subprocess.TimeoutExpired:
         log.e( log.red + test.name + log.reset + ':', configuration_str( configuration, repetition, suffix=' ' ) + 'timed out' )
     except subprocess.CalledProcessError as cpe:
-        if not check_log_for_fails( log_path, test.name, configuration, repetition, sns=sns ):
-            # An unexpected error occurred
-            log.e( log.red + test.name + log.reset + ':',
-                   configuration_str( configuration, repetition, suffix=' ' ) + 'exited with non-zero value (' + str(
-                       cpe.returncode ) + ')' )
+        # An unexpected error occurred, if there are no more retries issue error
+        if curr_retry == max_retry:
+            if not check_log_for_fails( log_path, test.name, configuration, repetition, sns=sns ):
+                # check_log_for_fails logs a more verbose message, but if it fails to do so log a general message here.
+                log.e( log.red + test.name + log.reset + ':',
+                       configuration_str( configuration, repetition, suffix=' ' ) + 'exited with non-zero value (' +
+                           str( cpe.returncode ) + ')' )
     else:
         return True
     return False
 
 
-def test_wrapper( test, configuration=None, repetition=1, sns=None ):
-    global n_tests
+def test_wrapper( test, configuration=None, repetition=1, serial_numbers=None, custom_fw_d400_override=None ):
+    global n_tests, n_failed_tests, retries
     n_tests += 1
-    for retry in range( test.config.retries + 1 ):
-        if test_wrapper_( test, configuration, repetition, retry, sns ):
+    retry_count = max(test.config.retries, retries)
+    for retry in range( retry_count + 1 ):
+        if retry:
+            if log.is_debug_on():
+                log.debug_unindent()  # just to make it stand out a little more
+                log.d( f'  Failed; retry #{retry}' )
+                log.debug_indent()
+            if no_reset or not serial_numbers:
+                time.sleep(1)  # small pause between tries
+            else:
+                devices.enable_only( serial_numbers, recycle=True )
+        if test_wrapper_( test, configuration, repetition, retry, retry_count, serial_numbers,
+                          custom_fw_d400_override=custom_fw_d400_override ):
             return True
-        log._n_errors -= 1
-        time.sleep( 1 )  # small pause between tries
-    log._n_errors += 1
+
+    n_failed_tests += 1
     return False
+
+
+def close_hubs():
+    #
+    # Disconnect from the hub -- if we don't it might crash on Linux...
+    # Before that we close all ports, no need for cameras to stay on between LibCI runs
+    if not list_only and not only_not_live:
+        if devices.hub and devices.hub.is_connected():
+            log.d("disconnecting from hub(s)")
+            devices.hub.disable_ports()
+            devices.wait_until_all_ports_disabled()
+            devices.hub.disconnect()
+
 
 # Run all tests
 try:
@@ -458,8 +558,10 @@ try:
         if pyrs:
             sys.path.insert( 1, pyrs_path )  # Make sure we pick up the right pyrealsense2!
         from rspy import devices
-
-        devices.query( hub_reset = hub_reset ) #resets the device
+        devices.init_hub()
+        register_signal_handlers(close_hubs)
+        disable_dds = "dds" not in context
+        devices.query( hub_reset = hub_reset, disable_dds = disable_dds, rslog = rslog ) #resets the device
         devices.map_unknown_ports()
         #
         # Under a development environment (i.e., without a hub), we may only have one device connected
@@ -488,6 +590,23 @@ try:
                 sns.update( included_devices )
             device_set = sns
             log.d( f'ignoring devices other than: {serial_numbers_to_string( device_set )}' )
+        #
+        if exclude_device_set is not None:
+            excluded_sns = set()  # convert the list of exclude specs to a list of serial numbers
+            for spec in exclude_device_set:
+                excluded_sns.update( devices.by_spec( spec, [] ) )
+            log.d( f'excluding devices: {serial_numbers_to_string( excluded_sns ) if excluded_sns else "(none connected match " + str(exclude_device_set) + ")"}' )
+
+            # Always narrow device_set to "connected minus excluded" — even when no connected device
+            # matches the exclude pattern. This makes `inclusions` truthy in devices.by_configuration,
+            # so configurations requiring an excluded product type are silently ignored instead of
+            # erroring with "no device matches configuration".
+            base = device_set if device_set is not None else set(devices.all())
+            if base:
+                device_set = base - excluded_sns
+                if not device_set:
+                    log.f( 'All devices were excluded; no devices left to test' )
+                log.d( f'using devices: {serial_numbers_to_string( device_set )}' )
         #
         log.progress()
     #
@@ -568,16 +687,59 @@ try:
             #
             test_ok = True
             for configuration, serial_numbers in devices_by_test_config( test, exceptions ):
+                # Currently, with all of our tests, serial_numbers holds a single serial number
+                # We will see multiple devices on serial_numbers only if the test specifies multiple devices in a
+                # single line. For example: "test:device D435 D455" will require both devices simultaneity
+
+                skip_test = False
+                for sn in serial_numbers:
+                    conn_type = devices.get(sn).connection_type.lower()
+                    excluded_connections = [ t[1:].lower() for t in test.config.types if t.startswith('!') ]
+                    required_connections = [ t.lower() for t in test.config.types if not t.startswith('!') ]
+                    if conn_type in excluded_connections:
+                        skip_test = True
+                        break
+                    if required_connections and conn_type not in required_connections:
+                        skip_test = True
+                        break
+
+                if skip_test:
+                    log.d( f'connection type does not fit {test.config.types}; skipping' )
+                    continue
+
+                fw_d400_override = None
+                fw_gate_skip = False
+                if test.name == 'test-fw-update':
+                    for sn in serial_numbers:
+                        d = devices.get( sn )
+                        skip_for_d, override = fw_compat.resolve_fw_gate(
+                            d, libci.home, test.name, sn=sn,
+                            custom_fw_d400_path=custom_fw_path,
+                            custom_fw_d555_path=custom_fw_d555_path )
+                        if skip_for_d:
+                            fw_gate_skip = True
+                        if override:
+                            fw_d400_override = override
+
+                if fw_gate_skip:
+                    n_tests += 1
+                    n_failed_tests += 1
+                    test_ok = False
+                    continue
+
                 for repetition in range(repeat):
                     try:
                         log.d( 'configuration:', configuration_str( configuration, repetition, sns=serial_numbers ) )
                         log.debug_indent()
-                        if not no_reset:
-                            devices.enable_only( serial_numbers, recycle=True )
-                    except RuntimeError as e:
+                        should_reset = not no_reset
+                        devices.enable_only( serial_numbers, recycle=should_reset )
+                    except (RuntimeError, TimeoutError, OSError) as e:
                         log.w( log.red + test.name + log.reset + ': ' + str( e ) )
+                        test_ok = False
                     else:
-                        test_ok = test_wrapper( test, configuration, repetition, sns=serial_numbers ) and test_ok
+                        register_signal_handlers()
+                        test_ok = test_wrapper( test, configuration, repetition, serial_numbers,
+                                                custom_fw_d400_override=fw_d400_override ) and test_ok
                     finally:
                         log.debug_unindent()
             if not test_ok:
@@ -591,7 +753,8 @@ try:
     log.progress()
     #
     if not n_tests:
-        log.f( 'No unit-tests found!' )
+        log.i( 'No unit-tests found; exiting' )
+        sys.exit(0)
     #
     if list_only:
         if list_tags and list_tests:
@@ -607,9 +770,8 @@ try:
                 print( t.name )
     #
     else:
-        n_errors = log.n_errors()
-        if n_errors:
-            log.out( log.red + str( n_errors ) + log.reset, 'of', n_tests, 'test(s)',
+        if failed_tests:
+            log.out( log.red + str( n_failed_tests ) + log.reset, 'of', n_tests, 'test(s)',
                      log.red + 'failed!' + log.reset + log.clear_eos )
             log.d( 'Failed tests:\n    ' + '\n    '.join( [test.name for test in failed_tests] ))
             sys.exit( 1 )
@@ -617,13 +779,6 @@ try:
         log.out( str( n_tests ) + ' unit-test(s) completed successfully' + log.clear_eos )
 #
 finally:
-    #
-    # Disconnect from the hub -- if we don't it might crash on Linux...
-    # Before that we close all ports, no need for cameras to stay on between LibCI runs
-    if not list_only and not only_not_live:
-        if devices.hub and devices.hub.is_connected():
-            devices.hub.disable_ports()
-            devices.wait_until_all_ports_disabled()
-            devices.hub.disconnect()
+    close_hubs()
 #
 sys.exit( 0 )
